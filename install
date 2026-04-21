@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+VSIX="claude-code-no-auto-attach-0.1.0.vsix"
+
+echo "==> Packaging $VSIX"
+npx --yes @vscode/vsce package --out "$VSIX" >/dev/null
+
+echo "==> Installing into VS Code"
+code --install-extension "$VSIX" --force
+
+echo
+echo "Done. Reload your VS Code window to activate the patch."

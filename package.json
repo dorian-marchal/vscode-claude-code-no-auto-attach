@@ -1,0 +1,32 @@
+{
+  "name": "claude-code-no-auto-attach",
+  "displayName": "Claude Code: No Auto-Attach",
+  "description": "Patches the Claude Code VS Code extension so the current-file/selection auto-attach defaults to OFF. Re-applies automatically when Claude Code updates.",
+  "version": "0.1.0",
+  "publisher": "dmarchal",
+  "private": true,
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dorianmarchal/vscode-claude-code-no-auto-attach"
+  },
+  "engines": {
+    "vscode": "^1.94.0"
+  },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "claude-code-no-auto-attach.apply",
+        "title": "Claude Code No Auto-Attach: Reapply Patch"
+      },
+      {
+        "command": "claude-code-no-auto-attach.revert",
+        "title": "Claude Code No Auto-Attach: Revert Patch (Reinstall Claude Code)"
+      }
+    ]
+  }
+}
