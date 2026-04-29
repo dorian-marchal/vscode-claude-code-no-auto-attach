@@ -25,8 +25,18 @@
       },
       {
         "command": "claude-code-no-auto-attach.revert",
-        "title": "Claude Code No Auto-Attach: Revert Patch (Reinstall Claude Code)"
+        "title": "Claude Code No Auto-Attach: Revert Patch"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Claude Code: No Auto-Attach",
+      "properties": {
+        "claude-code-no-auto-attach.autoApproveProtectedPathWrites": {
+          "type": "boolean",
+          "default": false,
+          "description": "Auto-approve Write/Edit/MultiEdit/NotebookEdit prompts that fire against Claude's own protected paths (e.g. .claude/, ~/.claude/settings.json) despite bypassPermissions. Only enable in trusted workspaces."
+        }
+      }
+    }
   }
 }
