@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v3*/';
+const MARKER = '/*claude-code-no-auto-attach:v5*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -58,36 +58,64 @@ function revertWebviewPatch(content) {
   return { reverted: true, content: next };
 }
 
-function computeCanUseToolPatch(content) {
-  if (content.startsWith(MARKER)) {
-    return { patched: false, reason: 'already patched' };
-  }
-
+function injectCanUseToolGuard(content) {
   const anchorRe = /if\((\w+)\.request\.subtype==="can_use_tool"\)\{if\(!this\.canUseTool\)throw Error\("canUseTool callback is not provided\."\);/g;
   const matches = [...content.matchAll(anchorRe)];
   if (matches.length === 0) {
-    return { patched: false, reason: 'can_use_tool anchor not found (Claude Code internals may have changed)' };
+    return { ok: false, reason: 'can_use_tool anchor not found (Claude Code internals may have changed)' };
   }
   if (matches.length > 1) {
-    return { patched: false, reason: `ambiguous: ${matches.length} can_use_tool anchors found` };
+    return { ok: false, reason: `ambiguous: ${matches.length} can_use_tool anchors found` };
   }
 
   const [anchor, varName] = matches[0];
   const insertion =
     `try{var __ccaaCfg=require("vscode").workspace.getConfiguration("claude-code-no-auto-attach");` +
-    `if(__ccaaCfg.get("autoApproveProtectedPathWrites",false)&&["Write","Edit","MultiEdit","NotebookEdit"].includes(${varName}.request.tool_name))` +
+    `if(__ccaaCfg.get("autoApproveProtectedPathWrites",false)&&globalThis.__ccaaPermissionMode==="bypassPermissions"&&["Write","Edit","MultiEdit","NotebookEdit","Bash"].includes(${varName}.request.tool_name))` +
     `return{behavior:"allow",updatedInput:${varName}.request.input,toolUseID:${varName}.request.tool_use_id};}catch(__ccaaErr){}`;
 
-  const next = MARKER + '\n' + content.replace(anchor, anchor + insertion);
-  return { patched: true, content: next };
+  return { ok: true, content: content.replace(anchor, anchor + insertion) };
 }
 
-function revertCanUseToolPatch(content) {
+function injectPermissionModeCapture(content) {
+  const anchorRe = /setPermissionMode\((\w+)\)\{await this\.request\(\{subtype:"set_permission_mode",mode:\1\}\)\}/g;
+  const matches = [...content.matchAll(anchorRe)];
+  if (matches.length === 0) {
+    return { ok: false, reason: 'setPermissionMode anchor not found (Claude Code internals may have changed)' };
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${matches.length} setPermissionMode anchors found` };
+  }
+
+  const [anchor, varName] = matches[0];
+  const replacement = anchor.replace(`${varName}){`, `${varName}){globalThis.__ccaaPermissionMode=${varName};`);
+  return { ok: true, content: content.replace(anchor, replacement) };
+}
+
+function computeExtensionPatch(content) {
+  if (content.startsWith(MARKER)) {
+    return { patched: false, reason: 'already patched' };
+  }
+
+  const guard = injectCanUseToolGuard(content);
+  if (!guard.ok) return { patched: false, reason: guard.reason };
+
+  const capture = injectPermissionModeCapture(guard.content);
+  if (!capture.ok) return { patched: false, reason: capture.reason };
+
+  return { patched: true, content: MARKER + '\n' + capture.content };
+}
+
+function revertExtensionPatch(content) {
   const stripped = stripMarker(content);
   if (stripped === null) return { reverted: false, reason: 'not patched' };
 
-  const injectionRe = /try\{var __ccaaCfg=require\("vscode"\)\.workspace\.getConfiguration\("claude-code-no-auto-attach"\);if\(__ccaaCfg\.get\("[A-Za-z]+",false\)&&\["Write","Edit","MultiEdit","NotebookEdit"\]\.includes\(\w+\.request\.tool_name\)\)return\{behavior:"allow",updatedInput:\w+\.request\.input,toolUseID:\w+\.request\.tool_use_id\};\}catch\(__ccaaErr\)\{\}/;
-  const next = injectionRe.test(stripped) ? stripped.replace(injectionRe, '') : stripped;
+  const guardRe = /try\{var __ccaaCfg=require\("vscode"\)\.workspace\.getConfiguration\("claude-code-no-auto-attach"\);[\s\S]*?\}catch\(__ccaaErr\)\{\}/;
+  let next = guardRe.test(stripped) ? stripped.replace(guardRe, '') : stripped;
+
+  const captureRe = /(setPermissionMode\((\w+)\)\{)globalThis\.__ccaaPermissionMode=\2;/;
+  next = captureRe.test(next) ? next.replace(captureRe, '$1') : next;
+
   return { reverted: true, content: next };
 }
 
@@ -100,9 +128,9 @@ const PATCH_SITES = [
   },
   {
     relativePath: ['extension.js'],
-    description: 'auto-allow gitignored Write/Edit prompts',
-    compute: computeCanUseToolPatch,
-    revert: revertCanUseToolPatch,
+    description: 'auto-allow gitignored Write/Edit prompts (bypass mode only) + capture permission mode',
+    compute: computeExtensionPatch,
+    revert: revertExtensionPatch,
   },
 ];
 
