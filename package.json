@@ -34,7 +34,7 @@
         "claude-code-no-auto-attach.autoApproveProtectedPathWrites": {
           "type": "boolean",
           "default": false,
-          "description": "Auto-approve Write/Edit/MultiEdit/NotebookEdit/Bash prompts that fire against Claude's own protected paths (e.g. .claude/, ~/.claude/settings.json) despite bypassPermissions. Mode-gated: only fires while permission mode is bypassPermissions, but the gate only arms after permission mode is set/changed once in the session — toggle to bypassPermissions once at session start. Only enable in trusted workspaces."
+          "description": "Auto-approve Write/Edit/MultiEdit/NotebookEdit/Bash prompts that fire against Claude's own protected paths (e.g. .claude/, ~/.claude/settings.json) despite bypassPermissions. Fires while permission mode is bypassPermissions (or before any setPermissionMode call has happened in the session). Only enable in trusted workspaces."
         }
       }
     }
