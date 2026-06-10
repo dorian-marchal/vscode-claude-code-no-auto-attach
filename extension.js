@@ -49,6 +49,55 @@ function revertAttachToggleOff(content) {
   return declRe.test(content) ? content.replace(declRe, '$1!0$2') : content;
 }
 
+const MODEL_UI_SENTINEL_RE = /;\/\*__ccaaModelUi\*\/[\s\S]*?\/\*__ccaaModelUiEnd\*\//g;
+
+// Inside the reactive effect that registers the "Switch model…" command action, append:
+// - a per-session model badge (fixed top-right of the webview, click opens the picker,
+//   warning colors when the session is on a Fable model)
+// - a Ctrl+M keydown handler (capture phase) that cycles through available models for
+//   the session rendered in this webview.
+function injectModelUi(content) {
+  const anchorRe =
+    /let ([\w$]+)=([\w$]+)\.modelSelection\.value,([\w$]+)=[\w$]+\(\2\.claudeConfig\.value\),[\s\S]{0,400}?,([\w$]+)=[\w$]+&&!\1\?\.startsWith\([\w$]+\.value\)\?[\s\S]{0,200}?\.registerAction\(\{id:"model",label:"Switch model…",description:"Change the AI model",trailingComponent:\4\?[\s\S]{0,200}?\},"Model",\(\)=>\{([\w$]+)\(!0\)\}\)/g;
+  const matches = [...content.matchAll(anchorRe)];
+  if (matches.length === 0) {
+    return { ok: false, reason: 'model action site not found (Claude Code internals may have changed)' };
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${matches.length} model action sites found` };
+  }
+
+  const [anchor, , sessionVar, , nameVar, openPickerVar] = matches[0];
+  const insertion =
+    `;/*__ccaaModelUi*/try{` +
+    `var __ccaaBadge=document.getElementById("ccaa-model-badge");` +
+    `if(!__ccaaBadge){__ccaaBadge=document.createElement("div");__ccaaBadge.id="ccaa-model-badge";` +
+    `__ccaaBadge.style.cssText="position:fixed;top:36px;right:14px;z-index:99999;padding:1px 8px;border-radius:9px;font-size:11px;font-family:var(--vscode-font-family);line-height:16px;cursor:pointer;user-select:none;opacity:.95";` +
+    `document.body.appendChild(__ccaaBadge)}` +
+    `__ccaaBadge.onclick=()=>${openPickerVar}(!0);` +
+    `var __ccaaModels=${sessionVar}.claudeConfig.value?.models??[];` +
+    `var __ccaaSelected=${sessionVar}.modelSelection.value??"default";` +
+    `var __ccaaLabel=${nameVar}??__ccaaModels.find((__ccaaM)=>__ccaaM.value===__ccaaSelected)?.displayName??__ccaaSelected;` +
+    `var __ccaaServed=${sessionVar}.currentMainLoopModel.value??"";` +
+    `__ccaaBadge.textContent=String(__ccaaLabel);` +
+    `__ccaaBadge.title="Claude model (click to switch, Ctrl+M to cycle)";` +
+    `var __ccaaExpensive=/fable/i.test(String(__ccaaSelected))||/fable/i.test(String(__ccaaLabel))||/fable/i.test(String(__ccaaServed));` +
+    `__ccaaBadge.style.background=__ccaaExpensive?"var(--vscode-statusBarItem-warningBackground,#915e00)":"var(--vscode-badge-background,#4d4d4d)";` +
+    `__ccaaBadge.style.color=__ccaaExpensive?"var(--vscode-statusBarItem-warningForeground,#fff)":"var(--vscode-badge-foreground,#fff)";` +
+    `globalThis.__ccaaCycleModel=()=>{` +
+    `var __ccaaList=${sessionVar}.claudeConfig.value?.models??[];if(__ccaaList.length<2)return;` +
+    `var __ccaaCurrent=${sessionVar}.modelSelection.value??"default";` +
+    `var __ccaaIndex=__ccaaList.findIndex((__ccaaM)=>__ccaaM.value===__ccaaCurrent);` +
+    `${sessionVar}.setModel(__ccaaList[(__ccaaIndex+1)%__ccaaList.length])};` +
+    `if(!globalThis.__ccaaModelKeyBound){globalThis.__ccaaModelKeyBound=!0;` +
+    `window.addEventListener("keydown",(__ccaaE)=>{` +
+    `if(__ccaaE.ctrlKey&&!__ccaaE.metaKey&&!__ccaaE.altKey&&!__ccaaE.shiftKey&&(__ccaaE.key==="m"||__ccaaE.key==="M")){` +
+    `__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaCycleModel?.()}},!0)}` +
+    `}catch(__ccaaErr2){}/*__ccaaModelUiEnd*/`;
+
+  return { ok: true, content: content.replace(anchor, anchor + insertion) };
+}
+
 // --- extension.js sub-patches ---
 
 function injectCanUseToolGuard(content) {
@@ -150,6 +199,7 @@ function computeWebviewPatch(content) {
   }
   return runSubPatches(content, [
     { name: 'attach-toggle-off', inject: injectAttachToggleOff },
+    { name: 'model-badge-and-shortcut', inject: injectModelUi },
   ]);
 }
 
@@ -158,6 +208,7 @@ function revertWebviewPatch(content) {
   if (stripped === null) return { reverted: false, reason: 'not patched' };
 
   let next = revertAttachToggleOff(stripped);
+  next = next.replace(MODEL_UI_SENTINEL_RE, '');
   return { reverted: true, content: next };
 }
 
@@ -185,7 +236,7 @@ function revertExtensionPatch(content) {
 const PATCH_SITES = [
   {
     relativePath: ['webview', 'index.js'],
-    description: 'default file-attach toggle to OFF',
+    description: 'attach toggle OFF + per-session model badge + Ctrl+M model cycle',
     compute: computeWebviewPatch,
     revert: revertWebviewPatch,
   },
