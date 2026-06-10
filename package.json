@@ -1,8 +1,8 @@
 {
   "name": "claude-code-no-auto-attach",
   "displayName": "Claude Code: No Auto-Attach",
-  "description": "Patches the Claude Code VS Code extension so the current-file/selection auto-attach defaults to OFF. Re-applies automatically when Claude Code updates.",
-  "version": "0.1.0",
+  "description": "Patches the Claude Code VS Code extension: auto-attach defaults to OFF, session-scoped model switching, per-session model badge, Ctrl+M model cycling. Re-applies automatically when Claude Code updates.",
+  "version": "0.2.1",
   "publisher": "dmarchal",
   "private": true,
   "license": "UNLICENSED",

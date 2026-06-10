@@ -3,7 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-VSIX="claude-code-no-auto-attach-0.1.0.vsix"
+VERSION="$(node -p "require('./package.json').version")"
+VSIX="claude-code-no-auto-attach-${VERSION}.vsix"
 
 echo "==> Packaging $VSIX"
 npx --yes @vscode/vsce package --out "$VSIX" >/dev/null
