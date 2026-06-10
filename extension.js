@@ -15,18 +15,16 @@ function stripMarker(content) {
   return m ? content.slice(m[0].length) : null;
 }
 
-function computeWebviewPatch(content) {
-  if (content.startsWith(MARKER)) {
-    return { patched: false, reason: 'already patched' };
-  }
+// --- webview/index.js sub-patches ---
 
+function injectAttachToggleOff(content) {
   const ownerRe = /includeSelection:([A-Za-z_$][\w$]*),onToggleIncludeSelection:\(\)=>([A-Za-z_$][\w$]*)\(/g;
   const matches = [...content.matchAll(ownerRe)];
   if (matches.length === 0) {
-    return { patched: false, reason: 'owner site not found (Claude Code internals may have changed)' };
+    return { ok: false, reason: 'owner site not found (Claude Code internals may have changed)' };
   }
   if (matches.length > 1) {
-    return { patched: false, reason: `ambiguous: ${matches.length} owner sites found` };
+    return { ok: false, reason: `ambiguous: ${matches.length} owner sites found` };
   }
 
   const [, stateVar, setterVar] = matches[0];
@@ -34,29 +32,24 @@ function computeWebviewPatch(content) {
     `(\\[${escapeRegex(stateVar)},${escapeRegex(setterVar)}\\]=[A-Za-z_$][\\w$]*\\.useState\\()!0(\\))`
   );
   if (!declRe.test(content)) {
-    return { patched: false, reason: `useState(!0) init for [${stateVar},${setterVar}] not found` };
+    return { ok: false, reason: `useState(!0) init for [${stateVar},${setterVar}] not found` };
   }
 
-  const next = MARKER + '\n' + content.replace(declRe, '$1!1$2');
-  return { patched: true, content: next };
+  return { ok: true, content: content.replace(declRe, '$1!1$2') };
 }
 
-function revertWebviewPatch(content) {
-  const stripped = stripMarker(content);
-  if (stripped === null) return { reverted: false, reason: 'not patched' };
-
+function revertAttachToggleOff(content) {
   const ownerRe = /includeSelection:([A-Za-z_$][\w$]*),onToggleIncludeSelection:\(\)=>([A-Za-z_$][\w$]*)\(/g;
-  const matches = [...stripped.matchAll(ownerRe)];
-  if (matches.length !== 1) {
-    return { reverted: false, reason: 'owner site not found/ambiguous on revert' };
-  }
+  const matches = [...content.matchAll(ownerRe)];
+  if (matches.length !== 1) return content;
   const [, stateVar, setterVar] = matches[0];
   const declRe = new RegExp(
     `(\\[${escapeRegex(stateVar)},${escapeRegex(setterVar)}\\]=[A-Za-z_$][\\w$]*\\.useState\\()!1(\\))`
   );
-  const next = declRe.test(stripped) ? stripped.replace(declRe, '$1!0$2') : stripped;
-  return { reverted: true, content: next };
+  return declRe.test(content) ? content.replace(declRe, '$1!0$2') : content;
 }
+
+// --- extension.js sub-patches ---
 
 function injectCanUseToolGuard(content) {
   const anchorRe = /if\((\w+)\.request\.subtype==="can_use_tool"\)\{if\(!this\.canUseTool\)throw Error\("canUseTool callback is not provided\."\);/g;
@@ -77,6 +70,11 @@ function injectCanUseToolGuard(content) {
   return { ok: true, content: content.replace(anchor, anchor + insertion) };
 }
 
+function revertCanUseToolGuard(content) {
+  const guardRe = /try\{var __ccaaCfg=require\("vscode"\)\.workspace\.getConfiguration\("claude-code-no-auto-attach"\);[\s\S]*?\}catch\(__ccaaErr\)\{\}/;
+  return guardRe.test(content) ? content.replace(guardRe, '') : content;
+}
+
 function injectPermissionModeCapture(content) {
   const anchorRe = /setPermissionMode\((\w+)\)\{await this\.request\(\{subtype:"set_permission_mode",mode:\1\}\)\}/g;
   const matches = [...content.matchAll(anchorRe)];
@@ -92,30 +90,67 @@ function injectPermissionModeCapture(content) {
   return { ok: true, content: content.replace(anchor, replacement) };
 }
 
+function revertPermissionModeCapture(content) {
+  const captureRe = /(setPermissionMode\((\w+)\)\{)globalThis\.__ccaaPermissionMode=\2;/;
+  return captureRe.test(content) ? content.replace(captureRe, '$1') : content;
+}
+
+// --- per-file compute/revert ---
+
+function runSubPatches(content, subPatches) {
+  const warnings = [];
+  let next = content;
+  let appliedCount = 0;
+
+  for (const sub of subPatches) {
+    const result = sub.inject(next);
+    if (result.ok) {
+      next = result.content;
+      appliedCount += 1;
+    } else {
+      warnings.push(`${sub.name}: ${result.reason}`);
+    }
+  }
+
+  if (appliedCount === 0) {
+    return { patched: false, reason: warnings.join('; ') };
+  }
+  return { patched: true, content: MARKER + '\n' + next, warnings };
+}
+
+function computeWebviewPatch(content) {
+  if (content.startsWith(MARKER)) {
+    return { patched: false, reason: 'already patched' };
+  }
+  return runSubPatches(content, [
+    { name: 'attach-toggle-off', inject: injectAttachToggleOff },
+  ]);
+}
+
+function revertWebviewPatch(content) {
+  const stripped = stripMarker(content);
+  if (stripped === null) return { reverted: false, reason: 'not patched' };
+
+  let next = revertAttachToggleOff(stripped);
+  return { reverted: true, content: next };
+}
+
 function computeExtensionPatch(content) {
   if (content.startsWith(MARKER)) {
     return { patched: false, reason: 'already patched' };
   }
-
-  const guard = injectCanUseToolGuard(content);
-  if (!guard.ok) return { patched: false, reason: guard.reason };
-
-  const capture = injectPermissionModeCapture(guard.content);
-  if (!capture.ok) return { patched: false, reason: capture.reason };
-
-  return { patched: true, content: MARKER + '\n' + capture.content };
+  return runSubPatches(content, [
+    { name: 'auto-approve-guard', inject: injectCanUseToolGuard },
+    { name: 'permission-mode-capture', inject: injectPermissionModeCapture },
+  ]);
 }
 
 function revertExtensionPatch(content) {
   const stripped = stripMarker(content);
   if (stripped === null) return { reverted: false, reason: 'not patched' };
 
-  const guardRe = /try\{var __ccaaCfg=require\("vscode"\)\.workspace\.getConfiguration\("claude-code-no-auto-attach"\);[\s\S]*?\}catch\(__ccaaErr\)\{\}/;
-  let next = guardRe.test(stripped) ? stripped.replace(guardRe, '') : stripped;
-
-  const captureRe = /(setPermissionMode\((\w+)\)\{)globalThis\.__ccaaPermissionMode=\2;/;
-  next = captureRe.test(next) ? next.replace(captureRe, '$1') : next;
-
+  let next = revertCanUseToolGuard(stripped);
+  next = revertPermissionModeCapture(next);
   return { reverted: true, content: next };
 }
 
@@ -192,6 +227,11 @@ async function applyPatch(channel, { interactive = false } = {}) {
         channel.appendLine(`[no-auto-attach] Skipped ${relLabel} (${result.reason}).`);
         skipMessages.push(`${relLabel}: ${result.reason}`);
         continue;
+      }
+
+      for (const warning of result.warnings || []) {
+        channel.appendLine(`[no-auto-attach] Partial patch ${relLabel}: ${warning}.`);
+        skipMessages.push(`${relLabel}: ${warning}`);
       }
 
       if (result.content === content) {
@@ -315,4 +355,12 @@ function activate(context) {
 
 function deactivate() {}
 
-module.exports = { activate, deactivate };
+module.exports = {
+  activate,
+  deactivate,
+  // exported for tests
+  computeWebviewPatch,
+  revertWebviewPatch,
+  computeExtensionPatch,
+  revertExtensionPatch,
+};
