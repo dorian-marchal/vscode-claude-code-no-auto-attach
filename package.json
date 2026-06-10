@@ -35,6 +35,11 @@
           "type": "boolean",
           "default": false,
           "description": "Auto-approve Write/Edit/MultiEdit/NotebookEdit/Bash prompts that fire against Claude's own protected paths (e.g. .claude/, ~/.claude/settings.json) despite bypassPermissions. Fires while permission mode is bypassPermissions (or before any setPermissionMode call has happened in the session). Only enable in trusted workspaces."
+        },
+        "claude-code-no-auto-attach.sessionScopedModelSwitch": {
+          "type": "boolean",
+          "default": true,
+          "description": "Make model switching session-scoped: selecting a model in a Claude Code session no longer rewrites the global default in ~/.claude/settings.json. Toggle OFF temporarily if you want a model switch to become the new global default. Takes effect immediately, no reload needed."
         }
       }
     }

@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v6*/';
+const MARKER = '/*claude-code-no-auto-attach:v8*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -95,6 +95,32 @@ function revertPermissionModeCapture(content) {
   return captureRe.test(content) ? content.replace(captureRe, '$1') : content;
 }
 
+const SESSION_MODEL_SENTINEL_RE = /\/\*__ccaaSessionModel\*\/[\s\S]*?\/\*__ccaaSessionModelEnd\*\//g;
+
+// Upstream persists every model switch to ~/.claude/settings.json (it becomes the new
+// global default). Reroute it to the SDK's session-scoped set_model control request so
+// switching only affects the current session.
+function injectSessionScopedModel(content) {
+  const anchorRe =
+    /async setModel\((\w+),(\w+)\)\{return await this\.writeUserSettingsAndPush\(\1,\{model:\2\.value==="default"\?null:\2\.value\}\),\{type:"set_model_response"\}\}/g;
+  const matches = [...content.matchAll(anchorRe)];
+  if (matches.length === 0) {
+    return { ok: false, reason: 'setModel anchor not found (Claude Code internals may have changed)' };
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${matches.length} setModel anchors found` };
+  }
+
+  const [anchor, channelVar, modelVar] = matches[0];
+  const insertion =
+    `/*__ccaaSessionModel*/var __ccaaScoped=true;` +
+    `try{__ccaaScoped=require("vscode").workspace.getConfiguration("claude-code-no-auto-attach").get("sessionScopedModelSwitch",true)}catch(__ccaaErr2){}` +
+    `if(__ccaaScoped)return await this.withChannel(${channelVar},async(__ccaaChannel)=>(await __ccaaChannel.query.setModel(${modelVar}.value==="default"?void 0:${modelVar}.value),{type:"set_model_response"}));` +
+    `/*__ccaaSessionModelEnd*/`;
+  const replacement = anchor.replace(`async setModel(${channelVar},${modelVar}){`, `async setModel(${channelVar},${modelVar}){${insertion}`);
+  return { ok: true, content: content.replace(anchor, replacement) };
+}
+
 // --- per-file compute/revert ---
 
 function runSubPatches(content, subPatches) {
@@ -142,6 +168,7 @@ function computeExtensionPatch(content) {
   return runSubPatches(content, [
     { name: 'auto-approve-guard', inject: injectCanUseToolGuard },
     { name: 'permission-mode-capture', inject: injectPermissionModeCapture },
+    { name: 'session-scoped-model', inject: injectSessionScopedModel },
   ]);
 }
 
@@ -151,6 +178,7 @@ function revertExtensionPatch(content) {
 
   let next = revertCanUseToolGuard(stripped);
   next = revertPermissionModeCapture(next);
+  next = next.replace(SESSION_MODEL_SENTINEL_RE, '');
   return { reverted: true, content: next };
 }
 
@@ -163,7 +191,7 @@ const PATCH_SITES = [
   },
   {
     relativePath: ['extension.js'],
-    description: 'auto-allow gitignored Write/Edit prompts (bypass mode only) + capture permission mode',
+    description: 'auto-allow gitignored Write/Edit prompts (bypass mode only) + capture permission mode + session-scoped model switch',
     compute: computeExtensionPatch,
     revert: revertExtensionPatch,
   },
