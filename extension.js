@@ -57,8 +57,13 @@ const MODEL_UI_SENTINEL_RE = /;\/\*__ccaaModelUi\*\/[\s\S]*?\/\*__ccaaModelUiEnd
 // - a Ctrl+M keydown handler (capture phase) that cycles through available models for
 //   the session rendered in this webview.
 function injectModelUi(content) {
+  // Match both the pre-2.1.177 inline label computation and the 2.1.177+ form, where it was
+  // extracted into a helper (…,ze=GCe(q,t.lastServedModel.value,Te);n.commandRegistry.registerAction…).
+  // We anchor on the stable bits — the modelSelection/claudeConfig reads and the
+  // registerAction("model") call — and read the trailing-component label var straight off the
+  // registerAction options instead of the (refactored) inline declaration.
   const anchorRe =
-    /let ([\w$]+)=([\w$]+)\.modelSelection\.value,([\w$]+)=[\w$]+\(\2\.claudeConfig\.value\),[\s\S]{0,400}?,([\w$]+)=[\w$]+&&!\1\?\.startsWith\([\w$]+\.value\)\?[\s\S]{0,200}?\.registerAction\(\{id:"model",label:"Switch model…",description:"Change the AI model",trailingComponent:\4\?[\s\S]{0,200}?\},"Model",\(\)=>\{([\w$]+)\(!0\)\}\)/g;
+    /let ([\w$]+)=([\w$]+)\.modelSelection\.value,[\w$]+=[\w$]+\(\2\.claudeConfig\.value\),[\s\S]{0,400}?\.registerAction\(\{id:"model",label:"Switch model…",description:"Change the AI model",trailingComponent:([\w$]+)\?[\s\S]{0,200}?\},"Model",\(\)=>\{([\w$]+)\(!0\)\}\)/g;
   const matches = [...content.matchAll(anchorRe)];
   if (matches.length === 0) {
     return { ok: false, reason: 'model action site not found (Claude Code internals may have changed)' };
@@ -67,7 +72,7 @@ function injectModelUi(content) {
     return { ok: false, reason: `ambiguous: ${matches.length} model action sites found` };
   }
 
-  const [anchor, , sessionVar, , nameVar, openPickerVar] = matches[0];
+  const [anchor, , sessionVar, nameVar, openPickerVar] = matches[0];
   const insertion =
     `;/*__ccaaModelUi*/try{` +
     `var __ccaaBadge=document.getElementById("ccaa-model-badge");` +
