@@ -5,6 +5,7 @@ A personal VS Code extension that patches the installed Claude Code extension to
 3. **Session-scoped model switching.** Upstream, picking a model in the UI rewrites the global default in `~/.claude/settings.json`, so every future session inherits it. The patch reroutes the switch through the SDK's session-scoped `set_model` control request: switching only affects the current session, new sessions start on your real default.
 4. **Per-session model badge.** Each Claude session webview shows the current model in a badge (top-right). It turns warning-colored on Fable models (double cost). Click it to open the model picker. Being per-webview, it stays correct with many concurrent sessions.
 5. **Ctrl+M cycles models.** With a Claude session focused, `Ctrl+M` cycles through the available models for that session only.
+6. **Sonnet/Haiku quick-send buttons.** Two extra send buttons sit next to the composer's send button — yellow switches the session to Sonnet, green to Haiku — then submit the prompt in one click. They reuse the session-scoped `setModel`, so the switch only affects the current session. Each button hides when its model isn't available; the original send button keeps its native send/stop behavior.
 
 ## How it works
 
@@ -12,7 +13,8 @@ On activation, the extension iterates every installed `~/.vscode/extensions/anth
 
 - **`webview/index.js`**
   - finds the unique site wiring the attach state to the toggle (`includeSelection:X,onToggleIncludeSelection:()=>Y(`) and flips `useState(!0)` to `useState(!1)`;
-  - appends to the reactive effect that registers the "Switch model…" command action: a DOM badge kept in sync with the session's `modelSelection`, plus a capture-phase `Ctrl+M` keydown listener calling the session's `setModel` with the next available model.
+  - appends to the reactive effect that registers the "Switch model…" command action: a DOM badge kept in sync with the session's `modelSelection`, plus a capture-phase `Ctrl+M` keydown listener calling the session's `setModel` with the next available model;
+  - finds the unique composer send button (`type:"submit"` + `className:X.sendButton` + `data-permission-mode`) and inserts two `type:"button"` siblings after it (Sonnet/yellow, Haiku/green) that call the in-scope session's `setModel` for the matching model, then `requestSubmit()` the form.
 - **`extension.js`**
   - finds the unique `can_use_tool` site and injects an early return that approves Write/Edit/MultiEdit/NotebookEdit/Bash when `autoApproveProtectedPathWrites` is on;
   - captures permission-mode changes into `globalThis.__ccaaPermissionMode` to gate the above;

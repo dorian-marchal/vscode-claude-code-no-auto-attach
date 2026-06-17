@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v8*/';
+const MARKER = '/*claude-code-no-auto-attach:v13*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -101,6 +101,50 @@ function injectModelUi(content) {
     `}catch(__ccaaErr2){}/*__ccaaModelUiEnd*/`;
 
   return { ok: true, content: content.replace(anchor, anchor + insertion) };
+}
+
+const SEND_MODEL_BUTTONS_SENTINEL_RE = /\/\*__ccaaSendBtns\*\/[\s\S]*?\/\*__ccaaSendBtnsEnd\*\//g;
+
+// Add two extra send buttons next to the composer's send button — one switches the session
+// to Sonnet, one to Haiku — then submit the prompt. They reuse the session's setModel
+// (session-scoped via the extension.js patch) and the form's native submit path, so the
+// only new behavior is "switch model on the fly, then send". Each button hides itself when
+// its model isn't available for the session. The original send button (and its send/stop
+// animation) is left untouched; the new ones sit to its right as plain shortcuts.
+function injectSendModelButtons(content) {
+  const anchorRe =
+    /([\w$]+(?:\.[\w$]+)*)\.createElement\("button",\{type:"submit",disabled:!([\w$]+)\.busy\.value&&!([\w$]+),className:([\w$]+)\.sendButton,"data-permission-mode":([\w$]+),onClick:\(([\w$]+)\)=>\{if\(\2\.busy\.value&&!\3\)\6\.preventDefault\(\),\2\.interrupt\(\)\}\},([\w$]+)\)/g;
+  const matches = [...content.matchAll(anchorRe)];
+  if (matches.length === 0) {
+    return { ok: false, reason: 'send button site not found (Claude Code internals may have changed)' };
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${matches.length} send button sites found` };
+  }
+
+  const [anchor, ce, sess, canSubmit, clsObj, , , icon] = matches[0];
+
+  const button = (modelRe, background, color) =>
+    `(()=>{` +
+    `var __ccaaModels=${sess}.claudeConfig.value?.models??[];` +
+    `var __ccaaTarget=__ccaaModels.find((__ccaaM)=>${modelRe}.test(__ccaaM.value)||${modelRe}.test(__ccaaM.displayName));` +
+    `if(!__ccaaTarget)return null;` +
+    `var __ccaaDisabled=${sess}.busy.value||!${canSubmit};` +
+    `return ${ce}.createElement("button",{type:"button",className:${clsObj}.sendButton,` +
+    `disabled:__ccaaDisabled,` +
+    `title:"Send with "+__ccaaTarget.displayName,` +
+    `style:{background:${JSON.stringify(background)},color:${JSON.stringify(color)},opacity:__ccaaDisabled?.45:1},` +
+    `onClick:(__ccaaEv)=>{__ccaaEv.preventDefault();` +
+    `var __ccaaForm=__ccaaEv.currentTarget.closest("form");` +
+    `Promise.resolve(${sess}.modelSelection.value===__ccaaTarget.value?null:${sess}.setModel(__ccaaTarget))` +
+    `.then(()=>{if(__ccaaForm)__ccaaForm.requestSubmit()})}` +
+    `},${icon})})()`;
+
+  const sonnet = button('/sonnet/i', '#e0b341', '#1a1a1a');
+  const haiku = button('/haiku/i', '#2ea043', '#ffffff');
+  const insertion = `/*__ccaaSendBtns*/,${sonnet},${haiku}/*__ccaaSendBtnsEnd*/`;
+
+  return { ok: true, content: content.replace(anchor, () => anchor + insertion) };
 }
 
 // --- extension.js sub-patches ---
@@ -205,6 +249,7 @@ function computeWebviewPatch(content) {
   return runSubPatches(content, [
     { name: 'attach-toggle-off', inject: injectAttachToggleOff },
     { name: 'model-badge-and-shortcut', inject: injectModelUi },
+    { name: 'send-model-buttons', inject: injectSendModelButtons },
   ]);
 }
 
@@ -214,6 +259,7 @@ function revertWebviewPatch(content) {
 
   let next = revertAttachToggleOff(stripped);
   next = next.replace(MODEL_UI_SENTINEL_RE, '');
+  next = next.replace(SEND_MODEL_BUTTONS_SENTINEL_RE, '');
   return { reverted: true, content: next };
 }
 
