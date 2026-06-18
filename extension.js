@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v13*/';
+const MARKER = '/*claude-code-no-auto-attach:v14*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -263,6 +263,34 @@ function revertWebviewPatch(content) {
   return { reverted: true, content: next };
 }
 
+const PROMPT_HEIGHT_SENTINEL_RE = /\n?\/\*__ccaaPromptHeight\*\/[\s\S]*?\/\*__ccaaPromptHeightEnd\*\//g;
+
+// Cap the height of rendered user prompts so a huge pasted prompt (e.g. a long
+// error log) no longer fills the whole webview — the bubble scrolls instead.
+// Short prompts are unaffected (max-height only caps, never grows). The bubble is
+// matched by a hash-independent attribute selector so it keeps working when Claude
+// Code's CSS-module hash (userMessage_XXXXXX) changes. The rule is appended last so
+// its (equal-specificity) overflow-y wins over upstream's overflow-y:hidden.
+function computePromptHeightPatch(content) {
+  if (content.startsWith(MARKER)) {
+    return { patched: false, reason: 'already patched' };
+  }
+  if (!/userMessage_/.test(content)) {
+    return { patched: false, reason: 'userMessage_ class not found (Claude Code internals may have changed)' };
+  }
+  const css =
+    `\n/*__ccaaPromptHeight*/` +
+    `[class*="userMessage_"]{max-height:40vh;overflow-y:auto;scrollbar-width:thin}` +
+    `/*__ccaaPromptHeightEnd*/`;
+  return { patched: true, content: MARKER + '\n' + content + css };
+}
+
+function revertPromptHeightPatch(content) {
+  const stripped = stripMarker(content);
+  if (stripped === null) return { reverted: false, reason: 'not patched' };
+  return { reverted: true, content: stripped.replace(PROMPT_HEIGHT_SENTINEL_RE, '') };
+}
+
 function computeExtensionPatch(content) {
   if (content.startsWith(MARKER)) {
     return { patched: false, reason: 'already patched' };
@@ -290,6 +318,12 @@ const PATCH_SITES = [
     description: 'attach toggle OFF + per-session model badge + Ctrl+M model cycle',
     compute: computeWebviewPatch,
     revert: revertWebviewPatch,
+  },
+  {
+    relativePath: ['webview', 'index.css'],
+    description: 'cap user prompt bubble height + make it scrollable',
+    compute: computePromptHeightPatch,
+    revert: revertPromptHeightPatch,
   },
   {
     relativePath: ['extension.js'],
@@ -491,6 +525,8 @@ module.exports = {
   // exported for tests
   computeWebviewPatch,
   revertWebviewPatch,
+  computePromptHeightPatch,
+  revertPromptHeightPatch,
   computeExtensionPatch,
   revertExtensionPatch,
 };

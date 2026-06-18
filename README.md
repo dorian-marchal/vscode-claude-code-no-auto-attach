@@ -6,15 +6,18 @@ A personal VS Code extension that patches the installed Claude Code extension to
 4. **Per-session model badge.** Each Claude session webview shows the current model in a badge (top-right). It turns warning-colored on Fable models (double cost). Click it to open the model picker. Being per-webview, it stays correct with many concurrent sessions.
 5. **Ctrl+M cycles models.** With a Claude session focused, `Ctrl+M` cycles through the available models for that session only.
 6. **Sonnet/Haiku quick-send buttons.** Two extra send buttons sit next to the composer's send button — yellow switches the session to Sonnet, green to Haiku — then submit the prompt in one click. They reuse the session-scoped `setModel`, so the switch only affects the current session. Each button hides when its model isn't available; the original send button keeps its native send/stop behavior.
+7. **Capped, scrollable prompt bubbles.** A huge pasted prompt (e.g. a long stack trace) no longer fills the whole webview — rendered user prompts are capped at `40vh` and scroll instead. Short prompts are unaffected.
 
 ## How it works
 
-On activation, the extension iterates every installed `~/.vscode/extensions/anthropic.claude-code-*` directory and applies independent sub-patches to two files (a sub-patch whose anchor no longer matches is skipped and logged without blocking the others):
+On activation, the extension iterates every installed `~/.vscode/extensions/anthropic.claude-code-*` directory and applies independent sub-patches to three files (a sub-patch whose anchor no longer matches is skipped and logged without blocking the others):
 
 - **`webview/index.js`**
   - finds the unique site wiring the attach state to the toggle (`includeSelection:X,onToggleIncludeSelection:()=>Y(`) and flips `useState(!0)` to `useState(!1)`;
   - appends to the reactive effect that registers the "Switch model…" command action: a DOM badge kept in sync with the session's `modelSelection`, plus a capture-phase `Ctrl+M` keydown listener calling the session's `setModel` with the next available model;
   - finds the unique composer send button (`type:"submit"` + `className:X.sendButton` + `data-permission-mode`) and inserts two `type:"button"` siblings after it (Sonnet/yellow, Haiku/green) that call the in-scope session's `setModel` for the matching model, then `requestSubmit()` the form.
+- **`webview/index.css`**
+  - appends a rule capping the user prompt bubble at `max-height:40vh` with `overflow-y:auto`. It targets the bubble via a hash-independent attribute selector (`[class*="userMessage_"]`) and is appended last so its equal-specificity `overflow-y` wins over upstream's `overflow-y:hidden`.
 - **`extension.js`**
   - finds the unique `can_use_tool` site and injects an early return that approves Write/Edit/MultiEdit/NotebookEdit/Bash when `autoApproveProtectedPathWrites` is on;
   - captures permission-mode changes into `globalThis.__ccaaPermissionMode` to gate the above;
