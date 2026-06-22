@@ -1,8 +1,8 @@
 {
   "name": "claude-code-no-auto-attach",
   "displayName": "Claude Code: No Auto-Attach",
-  "description": "Patches the Claude Code VS Code extension: auto-attach defaults to OFF, session-scoped model switching, per-session model badge, Ctrl+M model cycling, Sonnet/Haiku quick-send buttons, capped/scrollable prompt bubbles. Re-applies automatically when Claude Code updates.",
-  "version": "0.2.6",
+  "description": "Patches the Claude Code VS Code extension: auto-attach defaults to OFF (configurable), Ctrl+F context-attach toggle, session-scoped model switching, per-session model badge, Ctrl+M model cycling, Sonnet/Haiku quick-send buttons, capped/scrollable prompt bubbles. Re-applies automatically when Claude Code updates.",
+  "version": "0.3.0",
   "publisher": "dmarchal",
   "private": true,
   "license": "UNLICENSED",
@@ -31,6 +31,11 @@
     "configuration": {
       "title": "Claude Code: No Auto-Attach",
       "properties": {
+        "claude-code-no-auto-attach.detachContextByDefault": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start new Claude Code sessions with the current file/selection NOT attached as context (the original reason for this extension). Turn OFF to keep upstream behavior (attached by default). Either way, Ctrl+F toggles the attachment while a Claude session is focused. Applied by patching, so changing it re-applies the patch and prompts a window reload."
+        },
         "claude-code-no-auto-attach.autoApproveProtectedPathWrites": {
           "type": "boolean",
           "default": false,

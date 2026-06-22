@@ -2,12 +2,18 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v14*/';
+const MARKER = '/*claude-code-no-auto-attach:v15*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
 function escapeRegex(s) {
   return s.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
+}
+
+// Replace a single regex match at its exact index (avoids first-occurrence ambiguity
+// and `$`-in-replacement pitfalls of String.prototype.replace).
+function replaceMatch(content, match, replacement) {
+  return content.slice(0, match.index) + replacement + content.slice(match.index + match[0].length);
 }
 
 function stripMarker(content) {
@@ -17,36 +23,85 @@ function stripMarker(content) {
 
 // --- webview/index.js sub-patches ---
 
-function injectAttachToggleOff(content) {
+// Locate the useState init for the include-selection toggle. The [state,setter] pair name
+// is reused by other components earlier in the bundle, so anchor on the declaration closest
+// *before* the toggle prop (it lives in the same component) rather than the first match in
+// the file — otherwise revert flips the wrong component's state.
+function findIncludeSelectionUseState(content) {
   const ownerRe = /includeSelection:([A-Za-z_$][\w$]*),onToggleIncludeSelection:\(\)=>([A-Za-z_$][\w$]*)\(/g;
-  const matches = [...content.matchAll(ownerRe)];
-  if (matches.length === 0) {
+  const owners = [...content.matchAll(ownerRe)];
+  if (owners.length === 0) {
     return { ok: false, reason: 'owner site not found (Claude Code internals may have changed)' };
   }
-  if (matches.length > 1) {
-    return { ok: false, reason: `ambiguous: ${matches.length} owner sites found` };
+  if (owners.length > 1) {
+    return { ok: false, reason: `ambiguous: ${owners.length} owner sites found` };
   }
 
-  const [, stateVar, setterVar] = matches[0];
+  const [, stateVar, setterVar] = owners[0];
+  const toggleIndex = owners[0].index;
   const declRe = new RegExp(
-    `(\\[${escapeRegex(stateVar)},${escapeRegex(setterVar)}\\]=[A-Za-z_$][\\w$]*\\.useState\\()!0(\\))`
+    `\\[${escapeRegex(stateVar)},${escapeRegex(setterVar)}\\]=[A-Za-z_$][\\w$]*\\.useState\\((!0|!1)\\)`,
+    'g'
   );
-  if (!declRe.test(content)) {
-    return { ok: false, reason: `useState(!0) init for [${stateVar},${setterVar}] not found` };
+  let best = null;
+  for (const m of content.matchAll(declRe)) {
+    if (m.index < toggleIndex) best = m;
+    else break;
   }
+  if (!best) {
+    return { ok: false, reason: `useState init for [${stateVar},${setterVar}] not found` };
+  }
+  return { ok: true, match: best, init: best[1] };
+}
 
-  return { ok: true, content: content.replace(declRe, '$1!1$2') };
+function injectAttachToggleOff(content) {
+  const found = findIncludeSelectionUseState(content);
+  if (!found.ok) return found;
+  if (found.init === '!1') return { ok: true, content }; // already detached
+  return { ok: true, content: replaceMatch(content, found.match, found.match[0].replace(/\(!0\)$/, '(!1)')) };
 }
 
 function revertAttachToggleOff(content) {
-  const ownerRe = /includeSelection:([A-Za-z_$][\w$]*),onToggleIncludeSelection:\(\)=>([A-Za-z_$][\w$]*)\(/g;
-  const matches = [...content.matchAll(ownerRe)];
-  if (matches.length !== 1) return content;
-  const [, stateVar, setterVar] = matches[0];
-  const declRe = new RegExp(
-    `(\\[${escapeRegex(stateVar)},${escapeRegex(setterVar)}\\]=[A-Za-z_$][\\w$]*\\.useState\\()!1(\\))`
-  );
-  return declRe.test(content) ? content.replace(declRe, '$1!0$2') : content;
+  const found = findIncludeSelectionUseState(content);
+  if (!found.ok || found.init === '!0') return content; // nothing to revert
+  return replaceMatch(content, found.match, found.match[0].replace(/\(!1\)$/, '(!0)'));
+}
+
+const CONTEXT_TOGGLE_REVERT_RE =
+  /onToggleIncludeSelection:\/\*__ccaaCtxToggle\*\/[\s\S]*?globalThis\.__ccaaToggleContext=\(\)=>([\w$]+)\([\s\S]*?\/\*__ccaaCtxToggleEnd\*\//;
+
+// Expose the composer's include-selection toggle as a global and bind a capture-phase
+// Ctrl+F keydown that flips it — so the current file/selection can be attached/detached
+// from the keyboard while a Claude session is focused. The click toggle still works
+// (the original setter is preserved and reconstructed byte-exact on revert).
+function injectContextToggleShortcut(content) {
+  const anchorRe =
+    /includeSelection:([A-Za-z_$][\w$]*),onToggleIncludeSelection:\(\)=>([A-Za-z_$][\w$]*)\(\(([A-Za-z_$][\w$]*)\)=>!\3\)/g;
+  const matches = [...content.matchAll(anchorRe)];
+  if (matches.length === 0) {
+    return { ok: false, reason: 'include-selection toggle site not found (Claude Code internals may have changed)' };
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${matches.length} include-selection toggle sites found` };
+  }
+
+  const [whole, stateVar, setterVar] = matches[0];
+  const replacement =
+    `includeSelection:${stateVar},onToggleIncludeSelection:/*__ccaaCtxToggle*/(()=>{` +
+    `globalThis.__ccaaToggleContext=()=>${setterVar}((__ccaaT)=>!__ccaaT);` +
+    `if(!globalThis.__ccaaContextKeyBound){globalThis.__ccaaContextKeyBound=!0;` +
+    `window.addEventListener("keydown",(__ccaaE)=>{` +
+    `if(__ccaaE.ctrlKey&&!__ccaaE.metaKey&&!__ccaaE.altKey&&!__ccaaE.shiftKey&&(__ccaaE.key==="f"||__ccaaE.key==="F")){` +
+    `__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaToggleContext?.()}},!0)}` +
+    `return globalThis.__ccaaToggleContext})()/*__ccaaCtxToggleEnd*/`;
+
+  return { ok: true, content: content.replace(whole, () => replacement) };
+}
+
+function revertContextToggle(content) {
+  return CONTEXT_TOGGLE_REVERT_RE.test(content)
+    ? content.replace(CONTEXT_TOGGLE_REVERT_RE, (_, setterVar) => `onToggleIncludeSelection:()=>${setterVar}(($)=>!$)`)
+    : content;
 }
 
 const MODEL_UI_SENTINEL_RE = /;\/\*__ccaaModelUi\*\/[\s\S]*?\/\*__ccaaModelUiEnd\*\//g;
@@ -242,22 +297,32 @@ function runSubPatches(content, subPatches) {
   return { patched: true, content: MARKER + '\n' + next, warnings };
 }
 
-function computeWebviewPatch(content) {
+function computeWebviewPatch(content, { detachContextByDefault = true } = {}) {
   if (content.startsWith(MARKER)) {
     return { patched: false, reason: 'already patched' };
   }
-  return runSubPatches(content, [
-    { name: 'attach-toggle-off', inject: injectAttachToggleOff },
+  const subPatches = [];
+  // Default the include-selection toggle to OFF only when the setting allows it; when off,
+  // the upstream "attached by default" behavior is kept (the Ctrl+F toggle still works).
+  if (detachContextByDefault) {
+    subPatches.push({ name: 'attach-toggle-off', inject: injectAttachToggleOff });
+  }
+  subPatches.push(
     { name: 'model-badge-and-shortcut', inject: injectModelUi },
-    { name: 'send-model-buttons', inject: injectSendModelButtons },
-  ]);
+    { name: 'context-toggle-shortcut', inject: injectContextToggleShortcut },
+    { name: 'send-model-buttons', inject: injectSendModelButtons }
+  );
+  return runSubPatches(content, subPatches);
 }
 
 function revertWebviewPatch(content) {
   const stripped = stripMarker(content);
   if (stripped === null) return { reverted: false, reason: 'not patched' };
 
-  let next = revertAttachToggleOff(stripped);
+  // Revert the context toggle first so the attach-toggle anchor (which reads the clean
+  // onToggleIncludeSelection prop) resolves again.
+  let next = revertContextToggle(stripped);
+  next = revertAttachToggleOff(next);
   next = next.replace(MODEL_UI_SENTINEL_RE, '');
   next = next.replace(SEND_MODEL_BUTTONS_SENTINEL_RE, '');
   return { reverted: true, content: next };
@@ -315,7 +380,7 @@ function revertExtensionPatch(content) {
 const PATCH_SITES = [
   {
     relativePath: ['webview', 'index.js'],
-    description: 'attach toggle OFF + per-session model badge + Ctrl+M model cycle',
+    description: 'attach toggle OFF + per-session model badge + Ctrl+M model cycle + Ctrl+F context toggle',
     compute: computeWebviewPatch,
     revert: revertWebviewPatch,
   },
@@ -370,6 +435,11 @@ async function applyPatch(channel, { interactive = false } = {}) {
   let anyApplied = false;
   const skipMessages = [];
 
+  const config = vscode.workspace.getConfiguration('claude-code-no-auto-attach');
+  const computeOptions = {
+    detachContextByDefault: config.get('detachContextByDefault', true),
+  };
+
   for (const dir of dirs) {
     for (const site of PATCH_SITES) {
       const filePath = path.join(dir, ...site.relativePath);
@@ -386,7 +456,7 @@ async function applyPatch(channel, { interactive = false } = {}) {
       const reverted = site.revert(content);
       const baseContent = reverted.reverted ? reverted.content : content;
 
-      const result = site.compute(baseContent);
+      const result = site.compute(baseContent, computeOptions);
       if (!result.patched) {
         channel.appendLine(`[no-auto-attach] Skipped ${relLabel} (${result.reason}).`);
         skipMessages.push(`${relLabel}: ${result.reason}`);
@@ -501,6 +571,17 @@ function activate(context) {
     vscode.extensions.onDidChange(() => {
       channel.appendLine('[no-auto-attach] Extensions changed; re-checking patch.');
       applyPatch(channel);
+    })
+  );
+
+  // detachContextByDefault is baked in at patch time (the webview can't read VS Code
+  // settings), so re-apply when it changes instead of waiting for the next startup.
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('claude-code-no-auto-attach.detachContextByDefault')) {
+        channel.appendLine('[no-auto-attach] detachContextByDefault changed; re-applying patch.');
+        applyPatch(channel);
+      }
     })
   );
 
