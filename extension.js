@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v15*/';
+const MARKER = '/*claude-code-no-auto-attach:v16*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -101,6 +101,35 @@ function injectContextToggleShortcut(content) {
 function revertContextToggle(content) {
   return CONTEXT_TOGGLE_REVERT_RE.test(content)
     ? content.replace(CONTEXT_TOGGLE_REVERT_RE, (_, setterVar) => `onToggleIncludeSelection:()=>${setterVar}(($)=>!$)`)
+    : content;
+}
+
+const SLASH_SEL_REVERT_RE = /\/\*__ccaaSlashSel:(&&![\w$]+)\*\//;
+
+// On submit, upstream computes the include-selection flag as `gt=v&&!De` where v is the
+// toggle state and De is "the message starts with /". So the current file/selection is
+// silently dropped for *every* slash command — including skills — even when the toggle is
+// on. Drop the `&&!De` guard so the toggle alone decides; the original suffix is parked in
+// a sentinel comment for a byte-exact revert. (Explicitly attached files are passed
+// separately and were never affected; this is only the IDE current-file/selection path.)
+function injectSlashKeepsSelection(content) {
+  const anchorRe = /let ([\w$]+)=([\w$]+)(&&![\w$]+);(YXe\([\w$]+\.selection\.value,\1,)/g;
+  const matches = [...content.matchAll(anchorRe)];
+  if (matches.length === 0) {
+    return { ok: false, reason: 'selection-gate site not found (Claude Code internals may have changed)' };
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${matches.length} selection-gate sites found` };
+  }
+
+  const [whole, stateVar, toggleVar, suffix, tail] = matches[0];
+  const replacement = `let ${stateVar}=${toggleVar}/*__ccaaSlashSel:${suffix}*/;${tail}`;
+  return { ok: true, content: content.replace(whole, () => replacement) };
+}
+
+function revertSlashKeepsSelection(content) {
+  return SLASH_SEL_REVERT_RE.test(content)
+    ? content.replace(SLASH_SEL_REVERT_RE, (_, suffix) => suffix)
     : content;
 }
 
@@ -310,6 +339,7 @@ function computeWebviewPatch(content, { detachContextByDefault = true } = {}) {
   subPatches.push(
     { name: 'model-badge-and-shortcut', inject: injectModelUi },
     { name: 'context-toggle-shortcut', inject: injectContextToggleShortcut },
+    { name: 'slash-keeps-selection', inject: injectSlashKeepsSelection },
     { name: 'send-model-buttons', inject: injectSendModelButtons }
   );
   return runSubPatches(content, subPatches);
@@ -322,6 +352,7 @@ function revertWebviewPatch(content) {
   // Revert the context toggle first so the attach-toggle anchor (which reads the clean
   // onToggleIncludeSelection prop) resolves again.
   let next = revertContextToggle(stripped);
+  next = revertSlashKeepsSelection(next);
   next = revertAttachToggleOff(next);
   next = next.replace(MODEL_UI_SENTINEL_RE, '');
   next = next.replace(SEND_MODEL_BUTTONS_SENTINEL_RE, '');
