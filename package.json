@@ -1,8 +1,8 @@
 {
   "name": "claude-code-no-auto-attach",
   "displayName": "Claude Code: No Auto-Attach",
-  "description": "Patches the Claude Code VS Code extension: auto-attach defaults to OFF (configurable), Ctrl+F context-attach toggle, session-scoped model switching, per-session model badge, Ctrl+M model cycling, Sonnet/Haiku quick-send buttons, capped/scrollable prompt bubbles. Re-applies automatically when Claude Code updates.",
-  "version": "0.4.0",
+  "description": "Patches the Claude Code VS Code extension: auto-attach defaults to OFF (configurable), Ctrl+F context-attach toggle, session-scoped model switching, per-session model badge, Ctrl+M model cycling, Sonnet/Haiku quick-send buttons, capped/scrollable prompt bubbles, markdown-preview context attach. Re-applies automatically when Claude Code updates.",
+  "version": "0.5.0",
   "publisher": "dmarchal",
   "private": true,
   "license": "UNLICENSED",

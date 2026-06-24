@@ -304,6 +304,50 @@ function injectSessionScopedModel(content) {
   return { ok: true, content: content.replace(anchor, replacement) };
 }
 
+const MD_PREVIEW_SENTINEL_RE = /\/\*__ccaaMdPreview\*\/[\s\S]*?\/\*__ccaaMdPreviewEnd\*\//g;
+const MD_PREVIEW2_SENTINEL_RE = /\/\*__ccaaMdPreview2\*\/[\s\S]*?\/\*__ccaaMdPreview2End\*\//g;
+
+// A markdown *preview* is a webview tab, not a TextEditor, so focusing it makes
+// activeTextEditor undefined and Claude Code drops the current-file context (you'd
+// have to switch back to the raw .md). VS Code's TabInputWebview doesn't expose the
+// preview's source uri, but the preview tab label ends with the source basename
+// ("Preview README.md" / "[Preview] README.md"), so we resolve it ourselves: prefer
+// the last active markdown editor, then a uniquely-matching open markdown document,
+// then a unique workspace file. On a hit we set the same context object shape the
+// upstream E4 helper produces for an unselected file ({filePath,startLine,endLine}),
+// which the webview renders as just the basename. Two insertions, both reverted by
+// stripping their sentinel blocks: a tracker (records the last markdown editor) and
+// the resolver (runs in the `!r` branch before upstream's clear/retain logic).
+function injectMarkdownPreviewContext(content) {
+  const anchorRe =
+    /onDidChangeActiveTextEditor\(async\((\w+)\)=>\{if\(!\1\)\{if\((\w+)\(([\w$]+)\.window\.visibleTextEditors\.length\)==="retain"\)return;([\w$]+)\.bump\(\),([\w$]+)=void 0,([\w$]+)\.fire\(void 0\);return\}/g;
+  const matches = [...content.matchAll(anchorRe)];
+  if (matches.length === 0) {
+    return { ok: false, reason: 'active-editor handler not found (Claude Code internals may have changed)' };
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${matches.length} active-editor handlers found` };
+  }
+
+  const [whole, editorVar, retainFn, vscodeNs, staleGuard, contextVar, emitter] = matches[0];
+
+  const tracker =
+    `/*__ccaaMdPreview*/try{` +
+    `if(${editorVar}&&${editorVar}.document&&${editorVar}.document.languageId==="markdown")` +
+    `globalThis.__ccaaLastMd=${editorVar}.document.uri.fsPath` +
+    `}catch(__ccaaMd0){}/*__ccaaMdPreviewEnd*/`;
+
+  const resolver = String.raw`/*__ccaaMdPreview2*/try{var __ccaaBaseOf=function(__p){return String(__p).split(/[\\/]/).pop()};var __ccaaTab=${vscodeNs}.window.tabGroups&&${vscodeNs}.window.tabGroups.activeTabGroup&&${vscodeNs}.window.tabGroups.activeTabGroup.activeTab;var __ccaaIn=__ccaaTab&&__ccaaTab.input;if(__ccaaIn&&${vscodeNs}.TabInputWebview&&__ccaaIn instanceof ${vscodeNs}.TabInputWebview&&/markdown\.preview/.test(__ccaaIn.viewType||"")){var __ccaaLabel=__ccaaTab.label||"";var __ccaaPush=function(__fp){${staleGuard}.bump();${contextVar}={filePath:__fp,startLine:1,endLine:1};${emitter}.fire(${contextVar})};var __ccaaLast=globalThis.__ccaaLastMd;if(__ccaaLast&&__ccaaLabel.endsWith(__ccaaBaseOf(__ccaaLast))){__ccaaPush(__ccaaLast);return}var __ccaaDocs=(${vscodeNs}.workspace.textDocuments||[]).filter(function(__d){return __d.languageId==="markdown"&&__ccaaLabel.endsWith(__ccaaBaseOf(__d.uri.fsPath))});if(__ccaaDocs.length===1){__ccaaPush(__ccaaDocs[0].uri.fsPath);return}var __ccaaBase=__ccaaLabel.replace(/^\[?[^\]\s]*\]?\s+/,"");if(/\.(md|markdown|mdx)$/i.test(__ccaaBase)&&!/[*?{}\[\]]/.test(__ccaaBase)){var __ccaaG=${staleGuard}.bump();${vscodeNs}.workspace.findFiles("**/"+__ccaaBase,"**/node_modules/**",2).then(function(__h){if(__h&&__h.length===1&&!${staleGuard}.isStale(__ccaaG)){${contextVar}={filePath:__h[0].fsPath,startLine:1,endLine:1};${emitter}.fire(${contextVar})}},function(){});return}}}catch(__ccaaMd1){}/*__ccaaMdPreview2End*/`;
+
+  const replacement =
+    `onDidChangeActiveTextEditor(async(${editorVar})=>{` + tracker +
+    `if(!${editorVar}){` + resolver +
+    `if(${retainFn}(${vscodeNs}.window.visibleTextEditors.length)==="retain")return;` +
+    `${staleGuard}.bump(),${contextVar}=void 0,${emitter}.fire(void 0);return}`;
+
+  return { ok: true, content: content.replace(whole, () => replacement) };
+}
+
 // --- per-file compute/revert ---
 
 function runSubPatches(content, subPatches) {
@@ -396,6 +440,7 @@ function computeExtensionPatch(content) {
     { name: 'auto-approve-guard', inject: injectCanUseToolGuard },
     { name: 'permission-mode-capture', inject: injectPermissionModeCapture },
     { name: 'session-scoped-model', inject: injectSessionScopedModel },
+    { name: 'markdown-preview-context', inject: injectMarkdownPreviewContext },
   ]);
 }
 
@@ -406,6 +451,8 @@ function revertExtensionPatch(content) {
   let next = revertCanUseToolGuard(stripped);
   next = revertPermissionModeCapture(next);
   next = next.replace(SESSION_MODEL_SENTINEL_RE, '');
+  next = next.replace(MD_PREVIEW_SENTINEL_RE, '');
+  next = next.replace(MD_PREVIEW2_SENTINEL_RE, '');
   return { reverted: true, content: next };
 }
 
