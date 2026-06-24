@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v16*/';
+const MARKER = '/*claude-code-no-auto-attach:v17*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -170,9 +170,10 @@ function injectModelUi(content) {
     `var __ccaaServed=${sessionVar}.currentMainLoopModel.value??"";` +
     `__ccaaBadge.textContent=String(__ccaaLabel);` +
     `__ccaaBadge.title="Claude model (click to switch, Ctrl+M to cycle)";` +
-    `var __ccaaExpensive=/fable/i.test(String(__ccaaSelected))||/fable/i.test(String(__ccaaLabel))||/fable/i.test(String(__ccaaServed));` +
-    `__ccaaBadge.style.background=__ccaaExpensive?"var(--vscode-statusBarItem-warningBackground,#915e00)":"var(--vscode-badge-background,#4d4d4d)";` +
-    `__ccaaBadge.style.color=__ccaaExpensive?"var(--vscode-statusBarItem-warningForeground,#fff)":"var(--vscode-badge-foreground,#fff)";` +
+    `var __ccaaModelStr=(String(__ccaaSelected)+" "+String(__ccaaLabel)+" "+String(__ccaaServed)).toLowerCase();` +
+    `var __ccaaModelColor=/fable/.test(__ccaaModelStr)?"#8052d2":/opus/.test(__ccaaModelStr)?"#c63e3e":/sonnet/.test(__ccaaModelStr)?"#bc8e26":/haiku/.test(__ccaaModelStr)?"#269473":null;` +
+    `__ccaaBadge.style.background=__ccaaModelColor??"var(--vscode-badge-background,#4d4d4d)";` +
+    `__ccaaBadge.style.color=__ccaaModelColor?"#fff":"var(--vscode-badge-foreground,#fff)";` +
     `globalThis.__ccaaCycleModel=()=>{` +
     `var __ccaaList=${sessionVar}.claudeConfig.value?.models??[];if(__ccaaList.length<2)return;` +
     `var __ccaaCurrent=${sessionVar}.modelSelection.value??"default";` +
@@ -224,8 +225,8 @@ function injectSendModelButtons(content) {
     `.then(()=>{if(__ccaaForm)__ccaaForm.requestSubmit()})}` +
     `},${icon})})()`;
 
-  const sonnet = button('/sonnet/i', '#e0b341', '#1a1a1a');
-  const haiku = button('/haiku/i', '#2ea043', '#ffffff');
+  const sonnet = button('/sonnet/i', '#bc8e26', '#ffffff');
+  const haiku = button('/haiku/i', '#269473', '#ffffff');
   const insertion = `/*__ccaaSendBtns*/,${sonnet},${haiku}/*__ccaaSendBtnsEnd*/`;
 
   return { ok: true, content: content.replace(anchor, () => anchor + insertion) };
