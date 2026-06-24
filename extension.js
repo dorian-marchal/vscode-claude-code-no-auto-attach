@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v17*/';
+const MARKER = '/*claude-code-no-auto-attach:v18*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -306,6 +306,7 @@ function injectSessionScopedModel(content) {
 
 const MD_PREVIEW_SENTINEL_RE = /\/\*__ccaaMdPreview\*\/[\s\S]*?\/\*__ccaaMdPreviewEnd\*\//g;
 const MD_PREVIEW2_SENTINEL_RE = /\/\*__ccaaMdPreview2\*\/[\s\S]*?\/\*__ccaaMdPreview2End\*\//g;
+const MD_PREVIEW3_SENTINEL_RE = /\/\*__ccaaMdPreview3\*\/[\s\S]*?\/\*__ccaaMdPreview3End\*\//g;
 
 // A markdown *preview* is a webview tab, not a TextEditor, so focusing it makes
 // activeTextEditor undefined and Claude Code drops the current-file context (you'd
@@ -315,9 +316,13 @@ const MD_PREVIEW2_SENTINEL_RE = /\/\*__ccaaMdPreview2\*\/[\s\S]*?\/\*__ccaaMdPre
 // the last active markdown editor, then a uniquely-matching open markdown document,
 // then a unique workspace file. On a hit we set the same context object shape the
 // upstream E4 helper produces for an unselected file ({filePath,startLine,endLine}),
-// which the webview renders as just the basename. Two insertions, both reverted by
-// stripping their sentinel blocks: a tracker (records the last markdown editor) and
-// the resolver (runs in the `!r` branch before upstream's clear/retain logic).
+// which the webview renders as just the basename. Three insertions, all reverted by
+// stripping their sentinel blocks: a tracker (records the last markdown editor), the
+// resolver (runs in the `!r` branch before upstream's clear/retain logic), and a
+// tab-group listener (onDidChangeActiveTextEditor only fires on text-editor changes,
+// so preview->preview switches keep activeTextEditor undefined and never re-run the
+// resolver — the listener fires on active-tab changes too, registered once and
+// running the same resolver). A filePath dedup keeps the two paths from double-firing.
 function injectMarkdownPreviewContext(content) {
   const anchorRe =
     /onDidChangeActiveTextEditor\(async\((\w+)\)=>\{if\(!\1\)\{if\((\w+)\(([\w$]+)\.window\.visibleTextEditors\.length\)==="retain"\)return;([\w$]+)\.bump\(\),([\w$]+)=void 0,([\w$]+)\.fire\(void 0\);return\}/g;
@@ -337,10 +342,22 @@ function injectMarkdownPreviewContext(content) {
     `globalThis.__ccaaLastMd=${editorVar}.document.uri.fsPath` +
     `}catch(__ccaaMd0){}/*__ccaaMdPreviewEnd*/`;
 
-  const resolver = String.raw`/*__ccaaMdPreview2*/try{var __ccaaBaseOf=function(__p){return String(__p).split(/[\\/]/).pop()};var __ccaaTab=${vscodeNs}.window.tabGroups&&${vscodeNs}.window.tabGroups.activeTabGroup&&${vscodeNs}.window.tabGroups.activeTabGroup.activeTab;var __ccaaIn=__ccaaTab&&__ccaaTab.input;if(__ccaaIn&&${vscodeNs}.TabInputWebview&&__ccaaIn instanceof ${vscodeNs}.TabInputWebview&&/markdown\.preview/.test(__ccaaIn.viewType||"")){var __ccaaLabel=__ccaaTab.label||"";var __ccaaPush=function(__fp){${staleGuard}.bump();${contextVar}={filePath:__fp,startLine:1,endLine:1};${emitter}.fire(${contextVar})};var __ccaaLast=globalThis.__ccaaLastMd;if(__ccaaLast&&__ccaaLabel.endsWith(__ccaaBaseOf(__ccaaLast))){__ccaaPush(__ccaaLast);return}var __ccaaDocs=(${vscodeNs}.workspace.textDocuments||[]).filter(function(__d){return __d.languageId==="markdown"&&__ccaaLabel.endsWith(__ccaaBaseOf(__d.uri.fsPath))});if(__ccaaDocs.length===1){__ccaaPush(__ccaaDocs[0].uri.fsPath);return}var __ccaaBase=__ccaaLabel.replace(/^\[?[^\]\s]*\]?\s+/,"");if(/\.(md|markdown|mdx)$/i.test(__ccaaBase)&&!/[*?{}\[\]]/.test(__ccaaBase)){var __ccaaG=${staleGuard}.bump();${vscodeNs}.workspace.findFiles("**/"+__ccaaBase,"**/node_modules/**",2).then(function(__h){if(__h&&__h.length===1&&!${staleGuard}.isStale(__ccaaG)){${contextVar}={filePath:__h[0].fsPath,startLine:1,endLine:1};${emitter}.fire(${contextVar})}},function(){});return}}}catch(__ccaaMd1){}/*__ccaaMdPreview2End*/`;
+  // Shared resolver body (no try/catch, no sentinels) — reused by the active-editor
+  // handler and the tab-group listener. The leading filePath dedup in __ccaaPush (and
+  // the findFiles path) makes re-runs against the same preview a no-op.
+  const resolverBody = String.raw`var __ccaaBaseOf=function(__p){return String(__p).split(/[\\/]/).pop()};var __ccaaTab=${vscodeNs}.window.tabGroups&&${vscodeNs}.window.tabGroups.activeTabGroup&&${vscodeNs}.window.tabGroups.activeTabGroup.activeTab;var __ccaaIn=__ccaaTab&&__ccaaTab.input;if(__ccaaIn&&${vscodeNs}.TabInputWebview&&__ccaaIn instanceof ${vscodeNs}.TabInputWebview&&/markdown\.preview/.test(__ccaaIn.viewType||"")){var __ccaaLabel=__ccaaTab.label||"";var __ccaaPush=function(__fp){if(${contextVar}&&${contextVar}.filePath===__fp)return;${staleGuard}.bump();${contextVar}={filePath:__fp,startLine:1,endLine:1};${emitter}.fire(${contextVar})};var __ccaaLast=globalThis.__ccaaLastMd;if(__ccaaLast&&__ccaaLabel.endsWith(__ccaaBaseOf(__ccaaLast))){__ccaaPush(__ccaaLast);return}var __ccaaDocs=(${vscodeNs}.workspace.textDocuments||[]).filter(function(__d){return __d.languageId==="markdown"&&__ccaaLabel.endsWith(__ccaaBaseOf(__d.uri.fsPath))});if(__ccaaDocs.length===1){__ccaaPush(__ccaaDocs[0].uri.fsPath);return}var __ccaaBase=__ccaaLabel.replace(/^\[?[^\]\s]*\]?\s+/,"");if(/\.(md|markdown|mdx)$/i.test(__ccaaBase)&&!/[*?{}\[\]]/.test(__ccaaBase)){var __ccaaG=${staleGuard}.bump();${vscodeNs}.workspace.findFiles("**/"+__ccaaBase,"**/node_modules/**",2).then(function(__h){if(__h&&__h.length===1&&!${staleGuard}.isStale(__ccaaG)&&!(${contextVar}&&${contextVar}.filePath===__h[0].fsPath)){${contextVar}={filePath:__h[0].fsPath,startLine:1,endLine:1};${emitter}.fire(${contextVar})}},function(){});return}}`;
+
+  const resolver = `/*__ccaaMdPreview2*/try{` + resolverBody + `}catch(__ccaaMd1){}/*__ccaaMdPreview2End*/`;
+
+  // Registered once (global flag): an active-tab listener so preview<->preview switches
+  // re-resolve the source. Runs the same resolver in a closure over the module vars.
+  const tabListener =
+    `/*__ccaaMdPreview3*/try{if(!globalThis.__ccaaTabSub){globalThis.__ccaaTabSub=1;` +
+    `${vscodeNs}.window.tabGroups.onDidChangeTabGroups(function(){try{` + resolverBody +
+    `}catch(__ccaaMd2){}})}}catch(__ccaaMd3){}/*__ccaaMdPreview3End*/`;
 
   const replacement =
-    `onDidChangeActiveTextEditor(async(${editorVar})=>{` + tracker +
+    `onDidChangeActiveTextEditor(async(${editorVar})=>{` + tracker + tabListener +
     `if(!${editorVar}){` + resolver +
     `if(${retainFn}(${vscodeNs}.window.visibleTextEditors.length)==="retain")return;` +
     `${staleGuard}.bump(),${contextVar}=void 0,${emitter}.fire(void 0);return}`;
@@ -453,6 +470,7 @@ function revertExtensionPatch(content) {
   next = next.replace(SESSION_MODEL_SENTINEL_RE, '');
   next = next.replace(MD_PREVIEW_SENTINEL_RE, '');
   next = next.replace(MD_PREVIEW2_SENTINEL_RE, '');
+  next = next.replace(MD_PREVIEW3_SENTINEL_RE, '');
   return { reverted: true, content: next };
 }
 
