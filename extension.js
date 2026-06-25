@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v20*/';
+const MARKER = '/*claude-code-no-auto-attach:v21*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -449,6 +449,7 @@ function computePromptHeightPatch(content) {
   const css =
     `\n/*__ccaaPromptHeight*/` +
     `[class*="userMessage_"]{max-height:40vh;overflow-y:auto;scrollbar-width:thin}` +
+    `button[title^="Showing Claude your current file selection"]{color:#d97757}` +
     `/*__ccaaPromptHeightEnd*/`;
   return { patched: true, content: MARKER + '\n' + content + css };
 }
