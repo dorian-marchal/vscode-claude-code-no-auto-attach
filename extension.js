@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v21*/';
+const MARKER = '/*claude-code-no-auto-attach:v22*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -140,6 +140,9 @@ const MODEL_UI_SENTINEL_RE = /;\/\*__ccaaModelUi\*\/[\s\S]*?\/\*__ccaaModelUiEnd
 //   warning colors when the session is on a Fable model)
 // - a Ctrl+M keydown handler (capture phase) that cycles through available models for
 //   the session rendered in this webview.
+// - Ctrl+1 / Ctrl+2 / Ctrl+3 keydown handlers (same listener) that switch the session to
+//   Opus / Sonnet / Haiku and submit the composer in one go — the keyboard equivalent of
+//   the quick-send buttons.
 function injectModelUi(content) {
   // Match both the pre-2.1.177 inline label computation and the 2.1.177+ form, where it was
   // extracted into a helper (…,ze=GCe(q,t.lastServedModel.value,Te);n.commandRegistry.registerAction…).
@@ -179,10 +182,26 @@ function injectModelUi(content) {
     `var __ccaaCurrent=${sessionVar}.modelSelection.value??"default";` +
     `var __ccaaIndex=__ccaaList.findIndex((__ccaaM)=>__ccaaM.value===__ccaaCurrent);` +
     `${sessionVar}.setModel(__ccaaList[(__ccaaIndex+1)%__ccaaList.length])};` +
+    // Switch the session to the first model whose value/displayName matches the regex, then
+    // submit the composer — the keyboard equivalent of the quick-send buttons (Ctrl+1 Opus,
+    // Ctrl+2 Sonnet, Ctrl+3 Haiku). No-op while busy, when the composer can't submit (its send
+    // button is disabled), or when no model matches (e.g. Opus unavailable for the session).
+    `globalThis.__ccaaSendWithModel=(__ccaaRe)=>{` +
+    `var __ccaaBtn=document.querySelector('button[type="submit"][data-permission-mode]');` +
+    `if(!__ccaaBtn||__ccaaBtn.disabled||${sessionVar}.busy.value)return;` +
+    `var __ccaaList=${sessionVar}.claudeConfig.value?.models??[];` +
+    `var __ccaaTarget=__ccaaList.find((__ccaaM)=>__ccaaRe.test(__ccaaM.value)||__ccaaRe.test(__ccaaM.displayName));` +
+    `if(!__ccaaTarget)return;var __ccaaForm=__ccaaBtn.form;` +
+    `Promise.resolve(${sessionVar}.modelSelection.value===__ccaaTarget.value?null:${sessionVar}.setModel(__ccaaTarget))` +
+    `.then(()=>{if(__ccaaForm)__ccaaForm.requestSubmit()})};` +
     `if(!globalThis.__ccaaModelKeyBound){globalThis.__ccaaModelKeyBound=!0;` +
     `window.addEventListener("keydown",(__ccaaE)=>{` +
-    `if(__ccaaE.ctrlKey&&!__ccaaE.metaKey&&!__ccaaE.altKey&&!__ccaaE.shiftKey&&(__ccaaE.key==="m"||__ccaaE.key==="M")){` +
-    `__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaCycleModel?.()}},!0)}` +
+    `if(!(__ccaaE.ctrlKey&&!__ccaaE.metaKey&&!__ccaaE.altKey&&!__ccaaE.shiftKey))return;` +
+    `if(__ccaaE.key==="m"||__ccaaE.key==="M"){__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaCycleModel?.()}` +
+    `else if(__ccaaE.key==="1"){__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaSendWithModel?.(/opus/i)}` +
+    `else if(__ccaaE.key==="2"){__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaSendWithModel?.(/sonnet/i)}` +
+    `else if(__ccaaE.key==="3"){__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaSendWithModel?.(/haiku/i)}` +
+    `},!0)}` +
     `}catch(__ccaaErr2){}/*__ccaaModelUiEnd*/`;
 
   return { ok: true, content: content.replace(anchor, anchor + insertion) };
