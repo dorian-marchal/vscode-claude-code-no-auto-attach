@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v23*/';
+const MARKER = '/*claude-code-no-auto-attach:v24*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -144,8 +144,13 @@ const MODEL_UI_SENTINEL_RE = /;\/\*__ccaaModelUi\*\/[\s\S]*?\/\*__ccaaModelUiEnd
 // Inside the reactive effect that registers the "Switch model…" command action, append:
 // - a per-session model badge (fixed top-right of the webview, click opens the picker,
 //   warning colors when the session is on a Fable model)
+// - two effort helpers: __ccaaEffortFor(model) maps a model family to its preferred effort
+//   (Opus->xhigh, Sonnet/Haiku->medium) when the model supports it, else null;
+//   __ccaaApplyEffort(session,model) sets that effort (session-scoped via the extension.js
+//   patch). Both are used by every model-switch action below so switching model also bumps
+//   effort to match the family.
 // - a Ctrl+M keydown handler (capture phase) that cycles through available models for
-//   the session rendered in this webview.
+//   the session rendered in this webview (and applies the family's effort).
 // - Ctrl+1 / Ctrl+2 / Ctrl+3 keydown handlers (same listener) that switch the session to
 //   Opus / Sonnet / Haiku and submit the composer in one go — the keyboard equivalent of
 //   the quick-send buttons.
@@ -183,11 +188,26 @@ function injectModelUi(content) {
     `var __ccaaModelColor=/fable/.test(__ccaaModelStr)?"#8052d2":/opus/.test(__ccaaModelStr)?"#c63e3e":/sonnet/.test(__ccaaModelStr)?"#bc8e26":/haiku/.test(__ccaaModelStr)?"#269473":null;` +
     `__ccaaBadge.style.background=__ccaaModelColor??"var(--vscode-badge-background,#4d4d4d)";` +
     `__ccaaBadge.style.color=__ccaaModelColor?"#fff":"var(--vscode-badge-foreground,#fff)";` +
+    // Map a model to the effort we want for its family (Opus->xhigh, Sonnet/Haiku->medium),
+    // but only if the model reports it supports that level — else null (leave effort as-is).
+    `globalThis.__ccaaEffortFor=(__ccaaM)=>{` +
+    `if(!__ccaaM||!__ccaaM.supportsEffort)return null;` +
+    `var __ccaaS=(String(__ccaaM.value??"")+" "+String(__ccaaM.displayName??"")).toLowerCase();` +
+    `var __ccaaWant=/opus/.test(__ccaaS)?"xhigh":/sonnet/.test(__ccaaS)?"medium":/haiku/.test(__ccaaS)?"medium":null;` +
+    `if(!__ccaaWant)return null;var __ccaaLv=__ccaaM.supportedEffortLevels;` +
+    `return(!__ccaaLv||__ccaaLv.includes(__ccaaWant))?__ccaaWant:null};` +
+    // Set the family's effort for the given session. setEffortLevel no-ops internally when the
+    // level already matches, and the extension.js patch keeps the write session-scoped.
+    `globalThis.__ccaaApplyEffort=(__ccaaSess,__ccaaM)=>{` +
+    `try{var __ccaaW=globalThis.__ccaaEffortFor(__ccaaM);` +
+    `if(__ccaaW)return Promise.resolve(__ccaaSess.setEffortLevel(__ccaaW))}catch(__ccaaEfE){}` +
+    `return Promise.resolve()};` +
     `globalThis.__ccaaCycleModel=()=>{` +
     `var __ccaaList=${sessionVar}.claudeConfig.value?.models??[];if(__ccaaList.length<2)return;` +
     `var __ccaaCurrent=${sessionVar}.modelSelection.value??"default";` +
     `var __ccaaIndex=__ccaaList.findIndex((__ccaaM)=>__ccaaM.value===__ccaaCurrent);` +
-    `${sessionVar}.setModel(__ccaaList[(__ccaaIndex+1)%__ccaaList.length])};` +
+    `var __ccaaNext=__ccaaList[(__ccaaIndex+1)%__ccaaList.length];` +
+    `Promise.resolve(${sessionVar}.setModel(__ccaaNext)).then(()=>globalThis.__ccaaApplyEffort(${sessionVar},__ccaaNext))};` +
     // Switch the session to the first model whose value/displayName matches the regex, then
     // submit the composer — the keyboard equivalent of the quick-send buttons (Ctrl+1 Opus,
     // Ctrl+2 Sonnet, Ctrl+3 Haiku). No-op while busy, when the composer can't submit (its send
@@ -199,6 +219,7 @@ function injectModelUi(content) {
     `var __ccaaTarget=__ccaaList.find((__ccaaM)=>__ccaaRe.test(__ccaaM.value)||__ccaaRe.test(__ccaaM.displayName));` +
     `if(!__ccaaTarget)return;var __ccaaForm=__ccaaBtn.form;` +
     `Promise.resolve(${sessionVar}.modelSelection.value===__ccaaTarget.value?null:${sessionVar}.setModel(__ccaaTarget))` +
+    `.then(()=>globalThis.__ccaaApplyEffort(${sessionVar},__ccaaTarget))` +
     `.then(()=>{if(__ccaaForm)__ccaaForm.requestSubmit()})};` +
     `if(!globalThis.__ccaaModelKeyBound){globalThis.__ccaaModelKeyBound=!0;` +
     `window.addEventListener("keydown",(__ccaaE)=>{` +
@@ -217,9 +238,10 @@ const SEND_MODEL_BUTTONS_SENTINEL_RE = /\/\*__ccaaSendBtns\*\/[\s\S]*?\/\*__ccaa
 
 // Add two extra send buttons next to the composer's send button — one switches the session
 // to Sonnet, one to Haiku — then submit the prompt. They reuse the session's setModel
-// (session-scoped via the extension.js patch) and the form's native submit path, so the
-// only new behavior is "switch model on the fly, then send". Each button hides itself when
-// its model isn't available for the session. The original send button (and its send/stop
+// (session-scoped via the extension.js patch), bump the effort to match the model family via
+// __ccaaApplyEffort (defined by injectModelUi), and the form's native submit path, so the
+// only new behavior is "switch model + effort on the fly, then send". Each button hides itself
+// when its model isn't available for the session. The original send button (and its send/stop
 // animation) is left untouched; the new ones sit to its right as plain shortcuts.
 function injectSendModelButtons(content) {
   // Two JSX-call shapes must be matched: the classic `X.createElement("button",{…},ICON)`
@@ -257,6 +279,7 @@ function injectSendModelButtons(content) {
     `onClick:(__ccaaEv)=>{__ccaaEv.preventDefault();` +
     `var __ccaaForm=__ccaaEv.currentTarget.closest("form");` +
     `Promise.resolve(${sess}.modelSelection.value===__ccaaTarget.value?null:${sess}.setModel(__ccaaTarget))` +
+    `.then(()=>globalThis.__ccaaApplyEffort?.(${sess},__ccaaTarget))` +
     `.then(()=>{if(__ccaaForm)__ccaaForm.requestSubmit()})}` +
     `${close}})()`;
 
@@ -337,6 +360,41 @@ function injectSessionScopedModel(content) {
     `/*__ccaaSessionModelEnd*/`;
   const replacement = anchor.replace(`async setModel(${channelVar},${modelVar}){`, `async setModel(${channelVar},${modelVar}){${insertion}`);
   return { ok: true, content: content.replace(anchor, replacement) };
+}
+
+const SESSION_EFFORT_SENTINEL_RE = /\/\*__ccaaSessionEffort\*\/[\s\S]*?\/\*__ccaaSessionEffortEnd\*\//g;
+
+// Effort switches (the native picker and our model buttons/shortcuts) go through
+// apply_settings, which persists effortLevel to ~/.claude/settings.json — the new global
+// default — before pushing it to the session. Force effort-only applies to flagsOnly so they
+// only push to the current session, matching the session-scoped model switch. writeUserSettings
+// -AndPush always pushes the flags to the running session (the disk write is the only thing
+// guarded by flagsOnly), so the current session still gets the new effort. Effort-only means
+// the settings object's single key is "effortLevel" — the native effort picker and our
+// setEffortLevel both send exactly that; other apply_settings calls are left untouched.
+function injectSessionScopedEffort(content) {
+  const anchorRe =
+    /async applySettings\((\w+),(\w+),(\w+)\)\{return await this\.writeUserSettingsAndPush\(\1,\2,\3\),\{type:"apply_settings_response"\}\}/g;
+  const matches = [...content.matchAll(anchorRe)];
+  if (matches.length === 0) {
+    return { ok: false, reason: 'applySettings anchor not found (Claude Code internals may have changed)' };
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${matches.length} applySettings anchors found` };
+  }
+
+  const [anchor, channelVar, settingsVar, flagsVar] = matches[0];
+  const insertion =
+    `/*__ccaaSessionEffort*/try{if(!${flagsVar}&&${settingsVar}&&typeof ${settingsVar}==="object"){` +
+    `var __ccaaEffKeys=Object.keys(${settingsVar});` +
+    `if(__ccaaEffKeys.length===1&&__ccaaEffKeys[0]==="effortLevel"&&` +
+    `require("vscode").workspace.getConfiguration("claude-code-no-auto-attach").get("sessionScopedEffortSwitch",true))` +
+    `${flagsVar}=!0}}catch(__ccaaEffErr){}/*__ccaaSessionEffortEnd*/`;
+  const replacement = anchor.replace(
+    `async applySettings(${channelVar},${settingsVar},${flagsVar}){`,
+    `async applySettings(${channelVar},${settingsVar},${flagsVar}){${insertion}`
+  );
+  return { ok: true, content: content.replace(anchor, () => replacement) };
 }
 
 const MD_PREVIEW_SENTINEL_RE = /\/\*__ccaaMdPreview\*\/[\s\S]*?\/\*__ccaaMdPreviewEnd\*\//g;
@@ -503,6 +561,7 @@ function computeExtensionPatch(content) {
     { name: 'auto-approve-guard', inject: injectCanUseToolGuard },
     { name: 'permission-mode-capture', inject: injectPermissionModeCapture },
     { name: 'session-scoped-model', inject: injectSessionScopedModel },
+    { name: 'session-scoped-effort', inject: injectSessionScopedEffort },
     { name: 'markdown-preview-context', inject: injectMarkdownPreviewContext },
   ]);
 }
@@ -514,6 +573,7 @@ function revertExtensionPatch(content) {
   let next = revertCanUseToolGuard(stripped);
   next = revertPermissionModeCapture(next);
   next = next.replace(SESSION_MODEL_SENTINEL_RE, '');
+  next = next.replace(SESSION_EFFORT_SENTINEL_RE, '');
   next = next.replace(MD_PREVIEW_SENTINEL_RE, '');
   next = next.replace(MD_PREVIEW2_SENTINEL_RE, '');
   next = next.replace(MD_PREVIEW3_SENTINEL_RE, '');
@@ -535,7 +595,7 @@ const PATCH_SITES = [
   },
   {
     relativePath: ['extension.js'],
-    description: 'auto-allow gitignored Write/Edit prompts (bypass mode only) + capture permission mode + session-scoped model switch',
+    description: 'auto-allow gitignored Write/Edit prompts (bypass mode only) + capture permission mode + session-scoped model + session-scoped effort switch',
     compute: computeExtensionPatch,
     revert: revertExtensionPatch,
   },

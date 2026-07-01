@@ -1,8 +1,8 @@
 {
   "name": "claude-code-no-auto-attach",
   "displayName": "Claude Code: No Auto-Attach",
-  "description": "Patches the Claude Code VS Code extension: auto-attach defaults to OFF (configurable), Ctrl+F context-attach toggle, session-scoped model switching, per-session model badge, Ctrl+M model cycling, Ctrl+1/2/3 send-with-Opus/Sonnet/Haiku shortcuts, Sonnet/Haiku quick-send buttons, capped/scrollable prompt bubbles, markdown-preview context attach. Re-applies automatically when Claude Code updates.",
-  "version": "0.5.5",
+  "description": "Patches the Claude Code VS Code extension: auto-attach defaults to OFF (configurable), Ctrl+F context-attach toggle, session-scoped model switching, session-scoped effort switching, per-model effort presets (Opus xhigh / Sonnet+Haiku medium), per-session model badge, Ctrl+M model cycling, Ctrl+1/2/3 send-with-Opus/Sonnet/Haiku shortcuts, Sonnet/Haiku quick-send buttons, capped/scrollable prompt bubbles, markdown-preview context attach. Re-applies automatically when Claude Code updates.",
+  "version": "0.6.0",
   "publisher": "dmarchal",
   "private": true,
   "license": "UNLICENSED",
@@ -45,6 +45,11 @@
           "type": "boolean",
           "default": true,
           "description": "Make model switching session-scoped: selecting a model in a Claude Code session no longer rewrites the global default in ~/.claude/settings.json. Toggle OFF temporarily if you want a model switch to become the new global default. Takes effect immediately, no reload needed."
+        },
+        "claude-code-no-auto-attach.sessionScopedEffortSwitch": {
+          "type": "boolean",
+          "default": true,
+          "description": "Make effort switching session-scoped: changing the effort level (via the native picker or the model buttons/shortcuts that now set effort per model family) no longer rewrites the global default in ~/.claude/settings.json. Toggle OFF temporarily if you want an effort change to become the new global default. Takes effect immediately, no reload needed."
         }
       }
     }
