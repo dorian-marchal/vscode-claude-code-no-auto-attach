@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v24*/';
+const MARKER = '/*claude-code-no-auto-attach:v25*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -143,7 +143,9 @@ const MODEL_UI_SENTINEL_RE = /;\/\*__ccaaModelUi\*\/[\s\S]*?\/\*__ccaaModelUiEnd
 
 // Inside the reactive effect that registers the "Switch model…" command action, append:
 // - a per-session model badge (fixed top-right of the webview, click opens the picker,
-//   warning colors when the session is on a Fable model)
+//   warning colors when the session is on a Fable model). When the current model supports
+//   effort, the badge also shows the current effort level ("Model · xhigh", or "· ultra"
+//   under ultracode); it stays live because reading the effort signals re-runs this effect.
 // - two effort helpers: __ccaaEffortFor(model) maps a model family to its preferred effort
 //   (Opus->xhigh, Sonnet/Haiku->medium) when the model supports it, else null;
 //   __ccaaApplyEffort(session,model) sets that effort (session-scoped via the extension.js
@@ -182,8 +184,13 @@ function injectModelUi(content) {
     `var __ccaaSelected=${sessionVar}.modelSelection.value??"default";` +
     `var __ccaaLabel=${nameVar}??__ccaaModels.find((__ccaaM)=>__ccaaM.value===__ccaaSelected)?.displayName??__ccaaSelected;` +
     `var __ccaaServed=${sessionVar}.currentMainLoopModel.value??"";` +
-    `__ccaaBadge.textContent=String(__ccaaLabel);` +
-    `__ccaaBadge.title="Claude model (click to switch, Ctrl+M to cycle)";` +
+    // Append the current effort to the badge when the model supports it (reading these
+    // reactive signals also re-runs this effect on effort changes, keeping the badge live).
+    // Ultracode is xhigh + workflows, so show "ultra" rather than the bare "xhigh".
+    `var __ccaaEffort=(${sessionVar}.currentModelSupportsEffort?.value&&${sessionVar}.effortLevel?.value)?String(${sessionVar}.effortLevel.value):"";` +
+    `if(__ccaaEffort&&${sessionVar}.ultracodeEnabled?.value)__ccaaEffort="ultra";` +
+    `__ccaaBadge.textContent=__ccaaEffort?String(__ccaaLabel)+" · "+__ccaaEffort:String(__ccaaLabel);` +
+    `__ccaaBadge.title=(__ccaaEffort?"Claude model + effort ("+String(__ccaaLabel)+" · "+__ccaaEffort+")":"Claude model")+" (click to switch, Ctrl+M to cycle)";` +
     `var __ccaaModelStr=(String(__ccaaSelected)+" "+String(__ccaaLabel)+" "+String(__ccaaServed)).toLowerCase();` +
     `var __ccaaModelColor=/fable/.test(__ccaaModelStr)?"#8052d2":/opus/.test(__ccaaModelStr)?"#c63e3e":/sonnet/.test(__ccaaModelStr)?"#bc8e26":/haiku/.test(__ccaaModelStr)?"#269473":null;` +
     `__ccaaBadge.style.background=__ccaaModelColor??"var(--vscode-badge-background,#4d4d4d)";` +
