@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v22*/';
+const MARKER = '/*claude-code-no-auto-attach:v23*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -39,8 +39,11 @@ function findIncludeSelectionUseState(content) {
 
   const [, stateVar, setterVar] = owners[0];
   const toggleIndex = owners[0].index;
+  // The hook may be written as `X.useState(!0)` (older bundles) or, once the minifier
+  // aliases React's hooks to bare locals, `ne(!0)`. Match either, still pinned to the exact
+  // [state,setter] pair and a boolean init so it can only resolve to the toggle's useState.
   const declRe = new RegExp(
-    `\\[${escapeRegex(stateVar)},${escapeRegex(setterVar)}\\]=[A-Za-z_$][\\w$]*\\.useState\\((!0|!1)\\)`,
+    `\\[${escapeRegex(stateVar)},${escapeRegex(setterVar)}\\]=[A-Za-z_$][\\w$]*(?:\\.useState)?\\((!0|!1)\\)`,
     'g'
   );
   let best = null;
@@ -113,7 +116,10 @@ const SLASH_SEL_REVERT_RE = /\/\*__ccaaSlashSel:(&&![\w$]+)\*\//;
 // a sentinel comment for a byte-exact revert. (Explicitly attached files are passed
 // separately and were never affected; this is only the IDE current-file/selection path.)
 function injectSlashKeepsSelection(content) {
-  const anchorRe = /let ([\w$]+)=([\w$]+)(&&![\w$]+);(YXe\([\w$]+\.selection\.value,\1,)/g;
+  // Anchor on the stable shape — `let flag=toggle&&!startsWithSlash;helper(x.selection.value,flag,`
+  // — rather than the minified helper name (it churns between releases, e.g. YXe→rZe). The
+  // `.selection.value` read and the backreference to the just-declared flag keep it unique.
+  const anchorRe = /let ([\w$]+)=([\w$]+)(&&![\w$]+);([\w$]+\([\w$]+\.selection\.value,\1,)/g;
   const matches = [...content.matchAll(anchorRe)];
   if (matches.length === 0) {
     return { ok: false, reason: 'selection-gate site not found (Claude Code internals may have changed)' };
@@ -216,8 +222,13 @@ const SEND_MODEL_BUTTONS_SENTINEL_RE = /\/\*__ccaaSendBtns\*\/[\s\S]*?\/\*__ccaa
 // its model isn't available for the session. The original send button (and its send/stop
 // animation) is left untouched; the new ones sit to its right as plain shortcuts.
 function injectSendModelButtons(content) {
+  // Two JSX-call shapes must be matched: the classic `X.createElement("button",{…},ICON)`
+  // (positional child) and the newer runtime `b("button",{…,children:ICON})` (child as a
+  // prop). The factory is captured generically (bare `b` or dotted `X.createElement`) and the
+  // trailing child via an alternation, so a future switch between the two degrades to a skip,
+  // not a mismatch. Everything in between (the submit/interrupt handler) is the stable anchor.
   const anchorRe =
-    /([\w$]+(?:\.[\w$]+)*)\.createElement\("button",\{type:"submit",disabled:!([\w$]+)\.busy\.value&&!([\w$]+),className:([\w$]+)\.sendButton,"data-permission-mode":([\w$]+),onClick:\(([\w$]+)\)=>\{if\(\2\.busy\.value&&!\3\)\6\.preventDefault\(\),\2\.interrupt\(\)\}\},([\w$]+)\)/g;
+    /([\w$]+(?:\.[\w$]+)*)\("button",\{type:"submit",disabled:!([\w$]+)\.busy\.value&&!([\w$]+),className:([\w$]+)\.sendButton,"data-permission-mode":[\w$]+,onClick:\(([\w$]+)\)=>\{if\(\2\.busy\.value&&!\3\)\5\.preventDefault\(\),\2\.interrupt\(\)\}(?:\},([\w$]+)\)|,children:([\w$]+)\}\))/g;
   const matches = [...content.matchAll(anchorRe)];
   if (matches.length === 0) {
     return { ok: false, reason: 'send button site not found (Claude Code internals may have changed)' };
@@ -226,7 +237,12 @@ function injectSendModelButtons(content) {
     return { ok: false, reason: `ambiguous: ${matches.length} send button sites found` };
   }
 
-  const [anchor, ce, sess, canSubmit, clsObj, , , icon] = matches[0];
+  const [anchor, factory, sess, canSubmit, clsObj, , positionalChild, childProp] = matches[0];
+  const childAsProp = childProp !== undefined;
+  const child = childProp ?? positionalChild;
+  // Close the created element the same way the matched form did: child as a prop
+  // (`,children:X})`) or positional (`},X)`), so the injected buttons stay valid JSX calls.
+  const close = childAsProp ? `,children:${child}})` : `},${child})`;
 
   const button = (modelRe, background, color) =>
     `(()=>{` +
@@ -234,7 +250,7 @@ function injectSendModelButtons(content) {
     `var __ccaaTarget=__ccaaModels.find((__ccaaM)=>${modelRe}.test(__ccaaM.value)||${modelRe}.test(__ccaaM.displayName));` +
     `if(!__ccaaTarget)return null;` +
     `var __ccaaDisabled=${sess}.busy.value||!${canSubmit};` +
-    `return ${ce}.createElement("button",{type:"button",className:${clsObj}.sendButton,` +
+    `return ${factory}("button",{type:"button",className:${clsObj}.sendButton,` +
     `disabled:__ccaaDisabled,` +
     `title:"Send with "+__ccaaTarget.displayName,` +
     `style:{background:${JSON.stringify(background)},color:${JSON.stringify(color)},opacity:__ccaaDisabled?.45:1},` +
@@ -242,7 +258,7 @@ function injectSendModelButtons(content) {
     `var __ccaaForm=__ccaaEv.currentTarget.closest("form");` +
     `Promise.resolve(${sess}.modelSelection.value===__ccaaTarget.value?null:${sess}.setModel(__ccaaTarget))` +
     `.then(()=>{if(__ccaaForm)__ccaaForm.requestSubmit()})}` +
-    `},${icon})})()`;
+    `${close}})()`;
 
   const sonnet = button('/sonnet/i', '#bc8e26', '#ffffff');
   const haiku = button('/haiku/i', '#269473', '#ffffff');
