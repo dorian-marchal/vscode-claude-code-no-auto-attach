@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v26*/';
+const MARKER = '/*claude-code-no-auto-attach:v28*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -155,7 +155,7 @@ const MODEL_UI_SENTINEL_RE = /;\/\*__ccaaModelUi\*\/[\s\S]*?\/\*__ccaaModelUiEnd
 //   the session rendered in this webview (and applies the family's effort).
 // - Ctrl+0 / Ctrl+1 / Ctrl+2 / Ctrl+3 keydown handlers (same listener) that switch the
 //   session to Fable / Opus / Sonnet / Haiku and submit the composer in one go — the
-//   keyboard equivalent of the quick-send buttons (Fable has no button).
+//   keyboard equivalent of the quick-send buttons (Opus has no button).
 function injectModelUi(content) {
   // Match both the pre-2.1.177 inline label computation and the 2.1.177+ form, where it was
   // extracted into a helper (…,ze=GCe(q,t.lastServedModel.value,Te);n.commandRegistry.registerAction…).
@@ -210,6 +210,23 @@ function injectModelUi(content) {
     `try{var __ccaaW=globalThis.__ccaaEffortFor(__ccaaM);` +
     `if(__ccaaW)return Promise.resolve(__ccaaSess.setEffortLevel(__ccaaW))}catch(__ccaaEfE){}` +
     `return Promise.resolve()};` +
+    // Instant custom tooltip for the quick-send buttons (the native `title` attribute has a
+    // ~1s hover delay). A single reused #ccaa-tip node is positioned above the hovered
+    // element, flipped below and clamped horizontally when it would leave the viewport. All
+    // best-effort: wrapped in try/catch and called via optional chaining, so a failure or a
+    // skipped patch just means no tooltip, never a broken button.
+    `globalThis.__ccaaShowTip=(__ccaaEl,__ccaaText)=>{try{` +
+    `var __ccaaTip=document.getElementById("ccaa-tip");` +
+    `if(!__ccaaTip){__ccaaTip=document.createElement("div");__ccaaTip.id="ccaa-tip";` +
+    `__ccaaTip.style.cssText="position:fixed;z-index:99999;padding:3px 8px;border-radius:6px;font-size:11px;font-family:var(--vscode-font-family);line-height:16px;pointer-events:none;white-space:nowrap;background:var(--vscode-editorHoverWidget-background,#252526);color:var(--vscode-editorHoverWidget-foreground,#cccccc);border:1px solid var(--vscode-editorHoverWidget-border,#454545);box-shadow:0 2px 8px rgba(0,0,0,.4)";` +
+    `document.body.appendChild(__ccaaTip)}` +
+    `__ccaaTip.textContent=__ccaaText;__ccaaTip.style.display="block";` +
+    `var __ccaaR=__ccaaEl.getBoundingClientRect();var __ccaaHalf=__ccaaTip.offsetWidth/2;` +
+    `var __ccaaCx=Math.max(__ccaaHalf+4,Math.min(__ccaaR.left+__ccaaR.width/2,window.innerWidth-__ccaaHalf-4));` +
+    `var __ccaaTop=__ccaaR.top-__ccaaTip.offsetHeight-6;` +
+    `__ccaaTip.style.left=__ccaaCx+"px";__ccaaTip.style.top=(__ccaaTop<4?__ccaaR.bottom+6:__ccaaTop)+"px";` +
+    `__ccaaTip.style.transform="translateX(-50%)"}catch(__ccaaTe){}};` +
+    `globalThis.__ccaaHideTip=()=>{try{var __ccaaTip=document.getElementById("ccaa-tip");if(__ccaaTip)__ccaaTip.style.display="none"}catch(__ccaaTe){}};` +
     `globalThis.__ccaaCycleModel=()=>{` +
     `var __ccaaList=${sessionVar}.claudeConfig.value?.models??[];if(__ccaaList.length<2)return;` +
     `var __ccaaCurrent=${sessionVar}.modelSelection.value??"default";` +
@@ -245,8 +262,8 @@ function injectModelUi(content) {
 
 const SEND_MODEL_BUTTONS_SENTINEL_RE = /\/\*__ccaaSendBtns\*\/[\s\S]*?\/\*__ccaaSendBtnsEnd\*\//g;
 
-// Add two extra send buttons next to the composer's send button — one switches the session
-// to Sonnet, one to Haiku — then submit the prompt. They reuse the session's setModel
+// Add three extra send buttons next to the composer's send button — switching the session
+// to Sonnet, Haiku, or Fable — then submit the prompt. They reuse the session's setModel
 // (session-scoped via the extension.js patch), bump the effort to match the model family via
 // __ccaaApplyEffort (defined by injectModelUi), and the form's native submit path, so the
 // only new behavior is "switch model + effort on the fly, then send". Each button hides itself
@@ -275,26 +292,37 @@ function injectSendModelButtons(content) {
   // (`,children:X})`) or positional (`},X)`), so the injected buttons stay valid JSX calls.
   const close = childAsProp ? `,children:${child}})` : `},${child})`;
 
-  const button = (modelRe, background, color) =>
+  // shortcut is the Ctrl chord shown in the tooltip (e.g. "Ctrl + 2"), matching the
+  // keyboard handler injected by injectModelUi. The tooltip text also appends the effort the
+  // button will apply (via __ccaaEffortFor), so it reads "Send to Sonnet · medium [Ctrl + 2]".
+  // It's shown via the instant custom tooltip (__ccaaShowTip/__ccaaHideTip from injectModelUi,
+  // called with ?. so the button still works if that patch skips) to avoid the native
+  // `title` hover delay; the same text stays on `aria-label` for screen readers.
+  const button = (modelRe, background, color, shortcut) =>
     `(()=>{` +
     `var __ccaaModels=${sess}.claudeConfig.value?.models??[];` +
     `var __ccaaTarget=__ccaaModels.find((__ccaaM)=>${modelRe}.test(__ccaaM.value)||${modelRe}.test(__ccaaM.displayName));` +
     `if(!__ccaaTarget)return null;` +
     `var __ccaaDisabled=${sess}.busy.value||!${canSubmit};` +
+    `var __ccaaEff=globalThis.__ccaaEffortFor?.(__ccaaTarget);` +
+    `var __ccaaTip="Send to "+__ccaaTarget.displayName+(__ccaaEff?" · "+__ccaaEff:"")+" [${shortcut}]";` +
     `return ${factory}("button",{type:"button",className:${clsObj}.sendButton,` +
     `disabled:__ccaaDisabled,` +
-    `title:"Send with "+__ccaaTarget.displayName,` +
+    `"aria-label":__ccaaTip,` +
+    `onMouseEnter:(__ccaaEv)=>globalThis.__ccaaShowTip?.(__ccaaEv.currentTarget,__ccaaTip),` +
+    `onMouseLeave:()=>globalThis.__ccaaHideTip?.(),` +
     `style:{background:${JSON.stringify(background)},color:${JSON.stringify(color)},opacity:__ccaaDisabled?.45:1},` +
-    `onClick:(__ccaaEv)=>{__ccaaEv.preventDefault();` +
+    `onClick:(__ccaaEv)=>{__ccaaEv.preventDefault();globalThis.__ccaaHideTip?.();` +
     `var __ccaaForm=__ccaaEv.currentTarget.closest("form");` +
     `Promise.resolve(${sess}.modelSelection.value===__ccaaTarget.value?null:${sess}.setModel(__ccaaTarget))` +
     `.then(()=>globalThis.__ccaaApplyEffort?.(${sess},__ccaaTarget))` +
     `.then(()=>{if(__ccaaForm)__ccaaForm.requestSubmit()})}` +
     `${close}})()`;
 
-  const sonnet = button('/sonnet/i', '#bc8e26', '#ffffff');
-  const haiku = button('/haiku/i', '#269473', '#ffffff');
-  const insertion = `/*__ccaaSendBtns*/,${sonnet},${haiku}/*__ccaaSendBtnsEnd*/`;
+  const sonnet = button('/sonnet/i', '#bc8e26', '#ffffff', 'Ctrl + 2');
+  const haiku = button('/haiku/i', '#269473', '#ffffff', 'Ctrl + 3');
+  const fable = button('/fable/i', '#8052d2', '#ffffff', 'Ctrl + 0');
+  const insertion = `/*__ccaaSendBtns*/,${sonnet},${haiku},${fable}/*__ccaaSendBtnsEnd*/`;
 
   return { ok: true, content: content.replace(anchor, () => anchor + insertion) };
 }
