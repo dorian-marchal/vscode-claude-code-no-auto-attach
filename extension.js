@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v25*/';
+const MARKER = '/*claude-code-no-auto-attach:v26*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -153,9 +153,9 @@ const MODEL_UI_SENTINEL_RE = /;\/\*__ccaaModelUi\*\/[\s\S]*?\/\*__ccaaModelUiEnd
 //   effort to match the family.
 // - a Ctrl+M keydown handler (capture phase) that cycles through available models for
 //   the session rendered in this webview (and applies the family's effort).
-// - Ctrl+1 / Ctrl+2 / Ctrl+3 keydown handlers (same listener) that switch the session to
-//   Opus / Sonnet / Haiku and submit the composer in one go — the keyboard equivalent of
-//   the quick-send buttons.
+// - Ctrl+0 / Ctrl+1 / Ctrl+2 / Ctrl+3 keydown handlers (same listener) that switch the
+//   session to Fable / Opus / Sonnet / Haiku and submit the composer in one go — the
+//   keyboard equivalent of the quick-send buttons (Fable has no button).
 function injectModelUi(content) {
   // Match both the pre-2.1.177 inline label computation and the 2.1.177+ form, where it was
   // extracted into a helper (…,ze=GCe(q,t.lastServedModel.value,Te);n.commandRegistry.registerAction…).
@@ -195,12 +195,13 @@ function injectModelUi(content) {
     `var __ccaaModelColor=/fable/.test(__ccaaModelStr)?"#8052d2":/opus/.test(__ccaaModelStr)?"#c63e3e":/sonnet/.test(__ccaaModelStr)?"#bc8e26":/haiku/.test(__ccaaModelStr)?"#269473":null;` +
     `__ccaaBadge.style.background=__ccaaModelColor??"var(--vscode-badge-background,#4d4d4d)";` +
     `__ccaaBadge.style.color=__ccaaModelColor?"#fff":"var(--vscode-badge-foreground,#fff)";` +
-    // Map a model to the effort we want for its family (Opus->xhigh, Sonnet/Haiku->medium),
-    // but only if the model reports it supports that level — else null (leave effort as-is).
+    // Map a model to the effort we want for its family (Fable->high, Opus->xhigh,
+    // Sonnet/Haiku->medium), but only if the model reports it supports that level — else
+    // null (leave effort as-is).
     `globalThis.__ccaaEffortFor=(__ccaaM)=>{` +
     `if(!__ccaaM||!__ccaaM.supportsEffort)return null;` +
     `var __ccaaS=(String(__ccaaM.value??"")+" "+String(__ccaaM.displayName??"")).toLowerCase();` +
-    `var __ccaaWant=/opus/.test(__ccaaS)?"xhigh":/sonnet/.test(__ccaaS)?"medium":/haiku/.test(__ccaaS)?"medium":null;` +
+    `var __ccaaWant=/fable/.test(__ccaaS)?"high":/opus/.test(__ccaaS)?"xhigh":/sonnet/.test(__ccaaS)?"medium":/haiku/.test(__ccaaS)?"medium":null;` +
     `if(!__ccaaWant)return null;var __ccaaLv=__ccaaM.supportedEffortLevels;` +
     `return(!__ccaaLv||__ccaaLv.includes(__ccaaWant))?__ccaaWant:null};` +
     // Set the family's effort for the given session. setEffortLevel no-ops internally when the
@@ -216,9 +217,9 @@ function injectModelUi(content) {
     `var __ccaaNext=__ccaaList[(__ccaaIndex+1)%__ccaaList.length];` +
     `Promise.resolve(${sessionVar}.setModel(__ccaaNext)).then(()=>globalThis.__ccaaApplyEffort(${sessionVar},__ccaaNext))};` +
     // Switch the session to the first model whose value/displayName matches the regex, then
-    // submit the composer — the keyboard equivalent of the quick-send buttons (Ctrl+1 Opus,
-    // Ctrl+2 Sonnet, Ctrl+3 Haiku). No-op while busy, when the composer can't submit (its send
-    // button is disabled), or when no model matches (e.g. Opus unavailable for the session).
+    // submit the composer — the keyboard equivalent of the quick-send buttons (Ctrl+0 Fable,
+    // Ctrl+1 Opus, Ctrl+2 Sonnet, Ctrl+3 Haiku). No-op while busy, when the composer can't
+    // submit (its send button is disabled), or when no model matches (e.g. unavailable).
     `globalThis.__ccaaSendWithModel=(__ccaaRe)=>{` +
     `var __ccaaBtn=document.querySelector('button[type="submit"][data-permission-mode]');` +
     `if(!__ccaaBtn||__ccaaBtn.disabled||${sessionVar}.busy.value)return;` +
@@ -235,6 +236,7 @@ function injectModelUi(content) {
     `else if(__ccaaE.key==="1"){__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaSendWithModel?.(/opus/i)}` +
     `else if(__ccaaE.key==="2"){__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaSendWithModel?.(/sonnet/i)}` +
     `else if(__ccaaE.key==="3"){__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaSendWithModel?.(/haiku/i)}` +
+    `else if(__ccaaE.key==="0"){__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaSendWithModel?.(/fable/i)}` +
     `},!0)}` +
     `}catch(__ccaaErr2){}/*__ccaaModelUiEnd*/`;
 
