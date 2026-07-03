@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v28*/';
+const MARKER = '/*claude-code-no-auto-attach:v29*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -459,8 +459,12 @@ const MD_PREVIEW3_SENTINEL_RE = /\/\*__ccaaMdPreview3\*\/[\s\S]*?\/\*__ccaaMdPre
 // from double-firing. Opt-in debug log (touch ~/.ccaa-debug) writes the active tab's
 // input type / viewType / uri / label to <tmpdir>/ccaa-md-debug.log on each event.
 function injectMarkdownPreviewContext(content) {
+  // The clear branch resets one-or-more module state vars before firing (2.1.197 cleared
+  // just the context var; 2.1.198+ also clears a URI-string tracker: `Nd=void 0,G_=void 0,`).
+  // Capture the whole `X=void 0,` run so we can preserve it verbatim and stay tolerant of
+  // future additions; the context var (whose `.filePath` the resolver sets) is the first one.
   const anchorRe =
-    /onDidChangeActiveTextEditor\(async\((\w+)\)=>\{if\(!\1\)\{if\((\w+)\(([\w$]+)\.window\.visibleTextEditors\.length\)==="retain"\)return;([\w$]+)\.bump\(\),([\w$]+)=void 0,([\w$]+)\.fire\(void 0\);return\}/g;
+    /onDidChangeActiveTextEditor\(async\((\w+)\)=>\{if\(!\1\)\{if\((\w+)\(([\w$]+)\.window\.visibleTextEditors\.length\)==="retain"\)return;([\w$]+)\.bump\(\),((?:[\w$]+=void 0,)+)([\w$]+)\.fire\(void 0\);return\}/g;
   const matches = [...content.matchAll(anchorRe)];
   if (matches.length === 0) {
     return { ok: false, reason: 'active-editor handler not found (Claude Code internals may have changed)' };
@@ -469,7 +473,8 @@ function injectMarkdownPreviewContext(content) {
     return { ok: false, reason: `ambiguous: ${matches.length} active-editor handlers found` };
   }
 
-  const [whole, editorVar, retainFn, vscodeNs, staleGuard, contextVar, emitter] = matches[0];
+  const [whole, editorVar, retainFn, vscodeNs, staleGuard, clearBody, emitter] = matches[0];
+  const contextVar = clearBody.match(/^([\w$]+)=/)[1];
 
   const tracker =
     `/*__ccaaMdPreview*/try{` +
@@ -500,7 +505,7 @@ function injectMarkdownPreviewContext(content) {
     `onDidChangeActiveTextEditor(async(${editorVar})=>{` + tracker + tabListener +
     `if(!${editorVar}){` + resolver +
     `if(${retainFn}(${vscodeNs}.window.visibleTextEditors.length)==="retain")return;` +
-    `${staleGuard}.bump(),${contextVar}=void 0,${emitter}.fire(void 0);return}`;
+    `${staleGuard}.bump(),${clearBody}${emitter}.fire(void 0);return}`;
 
   return { ok: true, content: content.replace(whole, () => replacement) };
 }

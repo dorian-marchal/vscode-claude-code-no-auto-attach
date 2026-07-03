@@ -17,7 +17,7 @@ All logic is in [extension.js](extension.js) (no build step, no deps, no `node_m
 ## Updating anchors after a CC release
 
 Inspect the live bundle to rewrite regexes:
-`~/.vscode/extensions/anthropic.claude-code-<version>/...` (current: `2.1.197-darwin-arm64`).
+`~/.vscode/extensions/anthropic.claude-code-<version>/...` (current: `2.1.198-darwin-arm64`).
 
 ## Build / release
 
