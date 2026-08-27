@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v30*/';
+const MARKER = '/*claude-code-no-auto-attach:v31*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -175,26 +175,53 @@ function injectModelUi(content) {
   const [anchor, , sessionVar, nameVar, openPickerVar] = matches[0];
   const insertion =
     `;/*__ccaaModelUi*/try{` +
+    // The badge is a flex row of three spans: the served-model pill, an arrow, and the
+    // selected-model pill. Only the last one shows unless the two disagree (see drift below).
     `var __ccaaBadge=document.getElementById("ccaa-model-badge");` +
+    `if(__ccaaBadge&&!document.getElementById("ccaa-model-badge-main")){__ccaaBadge.remove();__ccaaBadge=null}` +
     `if(!__ccaaBadge){__ccaaBadge=document.createElement("div");__ccaaBadge.id="ccaa-model-badge";` +
-    `__ccaaBadge.style.cssText="position:fixed;top:36px;right:14px;z-index:99999;padding:1px 8px;border-radius:9px;font-size:11px;font-family:var(--vscode-font-family);line-height:16px;cursor:pointer;user-select:none;opacity:.95";` +
+    `__ccaaBadge.style.cssText="position:fixed;top:36px;right:14px;z-index:99999;display:flex;align-items:center;gap:4px;font-size:11px;font-family:var(--vscode-font-family);line-height:16px;cursor:pointer;user-select:none;opacity:.95";` +
+    `["ccaa-model-badge-served","ccaa-model-badge-arrow","ccaa-model-badge-main"].forEach((__ccaaId)=>{` +
+    `var __ccaaSpan=document.createElement("span");__ccaaSpan.id=__ccaaId;` +
+    `__ccaaSpan.style.cssText=__ccaaId==="ccaa-model-badge-arrow"?"color:var(--vscode-descriptionForeground,#999)":"padding:1px 8px;border-radius:9px";` +
+    `__ccaaBadge.appendChild(__ccaaSpan)});` +
     `document.body.appendChild(__ccaaBadge)}` +
     `__ccaaBadge.onclick=()=>${openPickerVar}(!0);` +
+    `var __ccaaServedEl=document.getElementById("ccaa-model-badge-served");` +
+    `var __ccaaArrowEl=document.getElementById("ccaa-model-badge-arrow");` +
+    `var __ccaaMainEl=document.getElementById("ccaa-model-badge-main");` +
     `var __ccaaModels=${sessionVar}.claudeConfig.value?.models??[];` +
     `var __ccaaSelected=${sessionVar}.modelSelection.value??"default";` +
-    `var __ccaaLabel=${nameVar}??__ccaaModels.find((__ccaaM)=>__ccaaM.value===__ccaaSelected)?.displayName??__ccaaSelected;` +
-    `var __ccaaServed=${sessionVar}.currentMainLoopModel.value??"";` +
+    `var __ccaaSelModel=__ccaaModels.find((__ccaaM)=>__ccaaM.value===__ccaaSelected);` +
+    `var __ccaaServed=String(${sessionVar}.lastServedModel?.value??${sessionVar}.currentMainLoopModel?.value??"");` +
+    `var __ccaaFamOf=(__ccaaS)=>(String(__ccaaS??"").toLowerCase().match(/fable|opus|sonnet|haiku/)??[null])[0];` +
+    `var __ccaaSelFam=__ccaaFamOf(__ccaaSelected+" "+(__ccaaSelModel?.displayName??""));` +
+    `var __ccaaServedFam=__ccaaFamOf(__ccaaServed);` +
+    // Drift: the session is served one family while another is selected — the switch only
+    // lands on the next request. Upstream's label (nameVar) then reads the *served* model,
+    // so a single badge would mix that text with the selected model's color; show both pills
+    // instead, served first and dimmed, so a pending switch is visible rather than confusing.
+    `var __ccaaDrift=!!(__ccaaSelFam&&__ccaaServedFam&&__ccaaSelFam!==__ccaaServedFam);` +
+    `var __ccaaLabel=(__ccaaDrift?null:${nameVar})??__ccaaSelModel?.displayName??__ccaaSelected;` +
+    `var __ccaaServedLabel=(__ccaaDrift?${nameVar}:null)??__ccaaModels.find((__ccaaM)=>__ccaaM.value===__ccaaServedFam)?.displayName??__ccaaServedFam;` +
     // Append the current effort to the badge when the model supports it (reading these
     // reactive signals also re-runs this effect on effort changes, keeping the badge live).
     // Ultracode is xhigh + workflows, so show "ultra" rather than the bare "xhigh".
     `var __ccaaEffort=(${sessionVar}.currentModelSupportsEffort?.value&&${sessionVar}.effortLevel?.value)?String(${sessionVar}.effortLevel.value):"";` +
     `if(__ccaaEffort&&${sessionVar}.ultracodeEnabled?.value)__ccaaEffort="ultra";` +
-    `__ccaaBadge.textContent=__ccaaEffort?String(__ccaaLabel)+" · "+__ccaaEffort:String(__ccaaLabel);` +
-    `__ccaaBadge.title=(__ccaaEffort?"Claude model + effort ("+String(__ccaaLabel)+" · "+__ccaaEffort+")":"Claude model")+" (click to switch, Ctrl+M to cycle)";` +
-    `var __ccaaModelStr=(String(__ccaaSelected)+" "+String(__ccaaLabel)+" "+String(__ccaaServed)).toLowerCase();` +
-    `var __ccaaModelColor=/fable/.test(__ccaaModelStr)?"#8052d2":/opus/.test(__ccaaModelStr)?"#c63e3e":/sonnet/.test(__ccaaModelStr)?"#bc8e26":/haiku/.test(__ccaaModelStr)?"#269473":null;` +
-    `__ccaaBadge.style.background=__ccaaModelColor??"var(--vscode-badge-background,#4d4d4d)";` +
-    `__ccaaBadge.style.color=__ccaaModelColor?"#fff":"var(--vscode-badge-foreground,#fff)";` +
+    `var __ccaaColorOf=(__ccaaF)=>__ccaaF==="fable"?"#8052d2":__ccaaF==="opus"?"#c63e3e":__ccaaF==="sonnet"?"#bc8e26":__ccaaF==="haiku"?"#269473":null;` +
+    `var __ccaaPaint=(__ccaaEl,__ccaaC)=>{__ccaaEl.style.background=__ccaaC??"var(--vscode-badge-background,#4d4d4d)";` +
+    `__ccaaEl.style.color=__ccaaC?"#fff":"var(--vscode-badge-foreground,#fff)"};` +
+    // Without a selected family (e.g. "default"), the served one still colors the badge.
+    `__ccaaMainEl.textContent=__ccaaEffort?String(__ccaaLabel)+" \xB7 "+__ccaaEffort:String(__ccaaLabel);` +
+    `__ccaaPaint(__ccaaMainEl,__ccaaColorOf(__ccaaSelFam??__ccaaServedFam));` +
+    `__ccaaServedEl.style.display=__ccaaArrowEl.style.display=__ccaaDrift?"":"none";` +
+    `if(__ccaaDrift){__ccaaArrowEl.textContent="\u2192";__ccaaServedEl.style.opacity=".6";` +
+    `__ccaaServedEl.textContent=String(__ccaaServedLabel);__ccaaPaint(__ccaaServedEl,__ccaaColorOf(__ccaaServedFam))}` +
+    `__ccaaBadge.title=(__ccaaDrift` +
+    `?"Still running "+String(__ccaaServedLabel)+" \u2014 switches to "+String(__ccaaLabel)+(__ccaaEffort?" \xB7 "+__ccaaEffort:"")+" on the next request"` +
+    `:__ccaaEffort?"Claude model + effort ("+String(__ccaaLabel)+" \xB7 "+__ccaaEffort+")":"Claude model")` +
+    `+" (click to switch, Ctrl+M to cycle)";` +
     // Map a model to the effort we want for its family (Fable->high, Opus->xhigh,
     // Sonnet/Haiku->medium), but only if the model reports it supports that level — else
     // null (leave effort as-is).
