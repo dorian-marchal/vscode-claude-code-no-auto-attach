@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v29*/';
+const MARKER = '/*claude-code-no-auto-attach:v30*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -233,6 +233,17 @@ function injectModelUi(content) {
     `var __ccaaIndex=__ccaaList.findIndex((__ccaaM)=>__ccaaM.value===__ccaaCurrent);` +
     `var __ccaaNext=__ccaaList[(__ccaaIndex+1)%__ccaaList.length];` +
     `Promise.resolve(${sessionVar}.setModel(__ccaaNext)).then(()=>globalThis.__ccaaApplyEffort(${sessionVar},__ccaaNext))};` +
+    // True when the session must be told to switch to the target model. modelSelection alone
+    // can't answer that: it is seeded from the *global* default model setting on launch, which
+    // the session-scoped setModel patch never writes — so a resumed session reads
+    // "opus[1m]" while the CLI is really serving Fable. Treat a served model outside the
+    // requested family as drift and switch anyway; without it a send would keep the old model
+    // yet still apply the target's effort (e.g. Fable answering at Opus' xhigh).
+    `var __ccaaNeedsSwitch=(__ccaaSess,__ccaaT,__ccaaRe)=>{` +
+    `if(__ccaaSess.modelSelection.value!==__ccaaT.value)return!0;` +
+    `var __ccaaCur=String(__ccaaSess.lastServedModel?.value??__ccaaSess.currentMainLoopModel?.value??"");` +
+    `return __ccaaCur?!__ccaaRe.test(__ccaaCur):!1};` +
+    `globalThis.__ccaaNeedsSwitch=__ccaaNeedsSwitch;` +
     // Switch the session to the first model whose value/displayName matches the regex, then
     // submit the composer — the keyboard equivalent of the quick-send buttons (Ctrl+0 Fable,
     // Ctrl+1 Opus, Ctrl+2 Sonnet, Ctrl+3 Haiku). No-op while busy, when the composer can't
@@ -243,7 +254,7 @@ function injectModelUi(content) {
     `var __ccaaList=${sessionVar}.claudeConfig.value?.models??[];` +
     `var __ccaaTarget=__ccaaList.find((__ccaaM)=>__ccaaRe.test(__ccaaM.value)||__ccaaRe.test(__ccaaM.displayName));` +
     `if(!__ccaaTarget)return;var __ccaaForm=__ccaaBtn.form;` +
-    `Promise.resolve(${sessionVar}.modelSelection.value===__ccaaTarget.value?null:${sessionVar}.setModel(__ccaaTarget))` +
+    `Promise.resolve(__ccaaNeedsSwitch(${sessionVar},__ccaaTarget,__ccaaRe)?${sessionVar}.setModel(__ccaaTarget):null)` +
     `.then(()=>globalThis.__ccaaApplyEffort(${sessionVar},__ccaaTarget))` +
     `.then(()=>{if(__ccaaForm)__ccaaForm.requestSubmit()})};` +
     `if(!globalThis.__ccaaModelKeyBound){globalThis.__ccaaModelKeyBound=!0;` +
@@ -264,8 +275,9 @@ const SEND_MODEL_BUTTONS_SENTINEL_RE = /\/\*__ccaaSendBtns\*\/[\s\S]*?\/\*__ccaa
 
 // Add three extra send buttons next to the composer's send button — switching the session
 // to Sonnet, Haiku, or Fable — then submit the prompt. They reuse the session's setModel
-// (session-scoped via the extension.js patch), bump the effort to match the model family via
-// __ccaaApplyEffort (defined by injectModelUi), and the form's native submit path, so the
+// (session-scoped via the extension.js patch), skip it only when __ccaaNeedsSwitch (defined by
+// injectModelUi) says the session already runs that model, bump the effort to match the model
+// family via __ccaaApplyEffort, and the form's native submit path, so the
 // only new behavior is "switch model + effort on the fly, then send". Each button hides itself
 // when its model isn't available for the session. The original send button (and its send/stop
 // animation) is left untouched; the new ones sit to its right as plain shortcuts.
@@ -314,7 +326,7 @@ function injectSendModelButtons(content) {
     `style:{background:${JSON.stringify(background)},color:${JSON.stringify(color)},opacity:__ccaaDisabled?.45:1},` +
     `onClick:(__ccaaEv)=>{__ccaaEv.preventDefault();globalThis.__ccaaHideTip?.();` +
     `var __ccaaForm=__ccaaEv.currentTarget.closest("form");` +
-    `Promise.resolve(${sess}.modelSelection.value===__ccaaTarget.value?null:${sess}.setModel(__ccaaTarget))` +
+    `Promise.resolve((globalThis.__ccaaNeedsSwitch?globalThis.__ccaaNeedsSwitch(${sess},__ccaaTarget,${modelRe}):${sess}.modelSelection.value!==__ccaaTarget.value)?${sess}.setModel(__ccaaTarget):null)` +
     `.then(()=>globalThis.__ccaaApplyEffort?.(${sess},__ccaaTarget))` +
     `.then(()=>{if(__ccaaForm)__ccaaForm.requestSubmit()})}` +
     `${close}})()`;
