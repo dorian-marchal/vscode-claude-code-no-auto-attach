@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v32*/';
+const MARKER = '/*claude-code-no-auto-attach:v33*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -136,6 +136,38 @@ function injectSlashKeepsSelection(content) {
 function revertSlashKeepsSelection(content) {
   return SLASH_SEL_REVERT_RE.test(content)
     ? content.replace(SLASH_SEL_REVERT_RE, (_, suffix) => suffix)
+    : content;
+}
+
+const RATE_LIMIT_REVERT_RE =
+  /\/\*__ccaaRateLimit\*\/[\w$]+\.status==="rejected"\?([\s\S]*?):null\/\*__ccaaRateLimitEnd\*\//;
+
+// Drop the "You've used N% of your session limit" / "Approaching weekly limit" banner: the
+// session sets rateLimitWarning from every rate_limit_event, and each one costs a dismiss
+// click. Only the "rejected" status is kept — that one means the limit is actually hit, so
+// it stays worth showing. The original expression is parked inside the sentinel for a
+// byte-exact revert.
+function injectHideRateLimitWarning(content) {
+  const anchorRe =
+    /else if\(([\w$]+)!==this\.dismissedRateLimitKey\)this\.rateLimitWarning\.value=([\w$]+\(([\w$]+)\));/g;
+  const matches = [...content.matchAll(anchorRe)];
+  if (matches.length === 0) {
+    return { ok: false, reason: 'rate-limit warning site not found (Claude Code internals may have changed)' };
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${matches.length} rate-limit warning sites found` };
+  }
+
+  const [whole, keyVar, call, infoVar] = matches[0];
+  const replacement =
+    `else if(${keyVar}!==this.dismissedRateLimitKey)this.rateLimitWarning.value=` +
+    `/*__ccaaRateLimit*/${infoVar}.status==="rejected"?${call}:null/*__ccaaRateLimitEnd*/;`;
+  return { ok: true, content: content.replace(whole, () => replacement) };
+}
+
+function revertHideRateLimitWarning(content) {
+  return RATE_LIMIT_REVERT_RE.test(content)
+    ? content.replace(RATE_LIMIT_REVERT_RE, (_, call) => call)
     : content;
 }
 
@@ -593,7 +625,8 @@ function computeWebviewPatch(content, { detachContextByDefault = true } = {}) {
     { name: 'model-badge-and-shortcut', inject: injectModelUi },
     { name: 'context-toggle-shortcut', inject: injectContextToggleShortcut },
     { name: 'slash-keeps-selection', inject: injectSlashKeepsSelection },
-    { name: 'send-model-buttons', inject: injectSendModelButtons }
+    { name: 'send-model-buttons', inject: injectSendModelButtons },
+    { name: 'hide-rate-limit-warning', inject: injectHideRateLimitWarning }
   );
   return runSubPatches(content, subPatches);
 }
@@ -606,6 +639,7 @@ function revertWebviewPatch(content) {
   // onToggleIncludeSelection prop) resolves again.
   let next = revertContextToggle(stripped);
   next = revertSlashKeepsSelection(next);
+  next = revertHideRateLimitWarning(next);
   next = revertAttachToggleOff(next);
   next = next.replace(MODEL_UI_SENTINEL_RE, '');
   next = next.replace(SEND_MODEL_BUTTONS_SENTINEL_RE, '');
@@ -671,7 +705,8 @@ function revertExtensionPatch(content) {
 const PATCH_SITES = [
   {
     relativePath: ['webview', 'index.js'],
-    description: 'attach toggle OFF + per-session model badge + Ctrl+M model cycle + Ctrl+F context toggle',
+    description:
+      'attach toggle OFF + per-session model badge + Ctrl+M model cycle + Ctrl+F context toggle + hide rate-limit warnings',
     compute: computeWebviewPatch,
     revert: revertWebviewPatch,
   },
