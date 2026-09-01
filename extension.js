@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v33*/';
+const MARKER = '/*claude-code-no-auto-attach:v36*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -146,11 +146,30 @@ const RATE_LIMIT_REVERT_RE =
 // session sets rateLimitWarning from every rate_limit_event, and each one costs a dismiss
 // click. Only the "rejected" status is kept — that one means the limit is actually hit, so
 // it stays worth showing. The original expression is parked inside the sentinel for a
-// byte-exact revert.
+// byte-exact revert. Two bundle generations are handled: 2.1.251+ routes the event through
+// a decision helper ("clear"/"show"/"keep-hidden") and builds the banner in the "show"
+// branch; older bundles assigned it directly behind a dismissedRateLimitKey check. Either
+// way the builder call is wrapped in the same sentinel conditional, so one revert regex
+// covers both.
 function injectHideRateLimitWarning(content) {
-  const anchorRe =
+  const showBranchRe =
+    /else if\(([\w$]+)==="show"\)\{let ([\w$]+)=([\w$]+\(([\w$]+)\));this\.rateLimitWarning\.value=\2,this\.shownRateLimitKey=\2===null\?null:[\w$]+\(\4\)\}/g;
+  const showMatches = [...content.matchAll(showBranchRe)];
+  if (showMatches.length === 1) {
+    const [whole, , resultVar, call, infoVar] = showMatches[0];
+    const replacement = whole.replace(
+      `let ${resultVar}=${call};`,
+      () => `let ${resultVar}=/*__ccaaRateLimit*/${infoVar}.status==="rejected"?${call}:null/*__ccaaRateLimitEnd*/;`
+    );
+    return { ok: true, content: replaceMatch(content, showMatches[0], replacement) };
+  }
+  if (showMatches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${showMatches.length} rate-limit show branches found` };
+  }
+
+  const legacyRe =
     /else if\(([\w$]+)!==this\.dismissedRateLimitKey\)this\.rateLimitWarning\.value=([\w$]+\(([\w$]+)\));/g;
-  const matches = [...content.matchAll(anchorRe)];
+  const matches = [...content.matchAll(legacyRe)];
   if (matches.length === 0) {
     return { ok: false, reason: 'rate-limit warning site not found (Claude Code internals may have changed)' };
   }
@@ -158,11 +177,11 @@ function injectHideRateLimitWarning(content) {
     return { ok: false, reason: `ambiguous: ${matches.length} rate-limit warning sites found` };
   }
 
-  const [whole, keyVar, call, infoVar] = matches[0];
+  const [, keyVar, call, infoVar] = matches[0];
   const replacement =
     `else if(${keyVar}!==this.dismissedRateLimitKey)this.rateLimitWarning.value=` +
     `/*__ccaaRateLimit*/${infoVar}.status==="rejected"?${call}:null/*__ccaaRateLimitEnd*/;`;
-  return { ok: true, content: content.replace(whole, () => replacement) };
+  return { ok: true, content: replaceMatch(content, matches[0], replacement) };
 }
 
 function revertHideRateLimitWarning(content) {
@@ -423,7 +442,7 @@ function injectCanUseToolGuard(content) {
     `if(__ccaaCfg.get("autoApproveProtectedPathWrites",false)&&(globalThis.__ccaaPermissionMode===undefined||globalThis.__ccaaPermissionMode==="bypassPermissions")&&["Write","Edit","MultiEdit","NotebookEdit","Bash"].includes(${varName}.request.tool_name))` +
     `return{behavior:"allow",updatedInput:${varName}.request.input,toolUseID:${varName}.request.tool_use_id};}catch(__ccaaErr){}`;
 
-  return { ok: true, content: content.replace(anchor, anchor + insertion) };
+  return { ok: true, content: content.replace(anchor, () => anchor + insertion) };
 }
 
 function revertCanUseToolGuard(content) {
@@ -432,7 +451,7 @@ function revertCanUseToolGuard(content) {
 }
 
 function injectPermissionModeCapture(content) {
-  const anchorRe = /setPermissionMode\((\w+)\)\{await this\.request\(\{subtype:"set_permission_mode",mode:\1\}\)\}/g;
+  const anchorRe = /setPermissionMode\(([\w$]+)\)\{await this\.request\(\{subtype:"set_permission_mode",mode:\1\}\)\}/g;
   const matches = [...content.matchAll(anchorRe)];
   if (matches.length === 0) {
     return { ok: false, reason: 'setPermissionMode anchor not found (Claude Code internals may have changed)' };
@@ -442,12 +461,12 @@ function injectPermissionModeCapture(content) {
   }
 
   const [anchor, varName] = matches[0];
-  const replacement = anchor.replace(`${varName}){`, `${varName}){globalThis.__ccaaPermissionMode=${varName};`);
-  return { ok: true, content: content.replace(anchor, replacement) };
+  const replacement = anchor.replace(`${varName}){`, () => `${varName}){globalThis.__ccaaPermissionMode=${varName};`);
+  return { ok: true, content: content.replace(anchor, () => replacement) };
 }
 
 function revertPermissionModeCapture(content) {
-  const captureRe = /(setPermissionMode\((\w+)\)\{)globalThis\.__ccaaPermissionMode=\2;/;
+  const captureRe = /(setPermissionMode\(([\w$]+)\)\{)globalThis\.__ccaaPermissionMode=\2;/;
   return captureRe.test(content) ? content.replace(captureRe, '$1') : content;
 }
 
@@ -458,7 +477,7 @@ const SESSION_MODEL_SENTINEL_RE = /\/\*__ccaaSessionModel\*\/[\s\S]*?\/\*__ccaaS
 // switching only affects the current session.
 function injectSessionScopedModel(content) {
   const anchorRe =
-    /async setModel\((\w+),(\w+)\)\{return await this\.writeUserSettingsAndPush\(\1,\{model:\2\.value==="default"\?null:\2\.value\}\),\{type:"set_model_response"\}\}/g;
+    /async setModel\(([\w$]+),([\w$]+)\)\{return await this\.writeUserSettingsAndPush\(\1,\{model:\2\.value==="default"\?null:\2\.value\}\),\{type:"set_model_response"\}\}/g;
   const matches = [...content.matchAll(anchorRe)];
   if (matches.length === 0) {
     return { ok: false, reason: 'setModel anchor not found (Claude Code internals may have changed)' };
@@ -473,8 +492,11 @@ function injectSessionScopedModel(content) {
     `try{__ccaaScoped=require("vscode").workspace.getConfiguration("claude-code-no-auto-attach").get("sessionScopedModelSwitch",true)}catch(__ccaaErr2){}` +
     `if(__ccaaScoped)return await this.withChannel(${channelVar},async(__ccaaChannel)=>(await __ccaaChannel.query.setModel(${modelVar}.value==="default"?void 0:${modelVar}.value),{type:"set_model_response"}));` +
     `/*__ccaaSessionModelEnd*/`;
-  const replacement = anchor.replace(`async setModel(${channelVar},${modelVar}){`, `async setModel(${channelVar},${modelVar}){${insertion}`);
-  return { ok: true, content: content.replace(anchor, replacement) };
+  const replacement = anchor.replace(
+    `async setModel(${channelVar},${modelVar}){`,
+    () => `async setModel(${channelVar},${modelVar}){${insertion}`
+  );
+  return { ok: true, content: content.replace(anchor, () => replacement) };
 }
 
 const SESSION_EFFORT_SENTINEL_RE = /\/\*__ccaaSessionEffort\*\/[\s\S]*?\/\*__ccaaSessionEffortEnd\*\//g;
@@ -489,7 +511,7 @@ const SESSION_EFFORT_SENTINEL_RE = /\/\*__ccaaSessionEffort\*\/[\s\S]*?\/\*__cca
 // setEffortLevel both send exactly that; other apply_settings calls are left untouched.
 function injectSessionScopedEffort(content) {
   const anchorRe =
-    /async applySettings\((\w+),(\w+),(\w+)\)\{return await this\.writeUserSettingsAndPush\(\1,\2,\3\),\{type:"apply_settings_response"\}\}/g;
+    /async applySettings\(([\w$]+),([\w$]+),([\w$]+)\)\{return await this\.writeUserSettingsAndPush\(\1,\2,\3\),\{type:"apply_settings_response"\}\}/g;
   const matches = [...content.matchAll(anchorRe)];
   if (matches.length === 0) {
     return { ok: false, reason: 'applySettings anchor not found (Claude Code internals may have changed)' };
@@ -507,7 +529,7 @@ function injectSessionScopedEffort(content) {
     `${flagsVar}=!0}}catch(__ccaaEffErr){}/*__ccaaSessionEffortEnd*/`;
   const replacement = anchor.replace(
     `async applySettings(${channelVar},${settingsVar},${flagsVar}){`,
-    `async applySettings(${channelVar},${settingsVar},${flagsVar}){${insertion}`
+    () => `async applySettings(${channelVar},${settingsVar},${flagsVar}){${insertion}`
   );
   return { ok: true, content: content.replace(anchor, () => replacement) };
 }

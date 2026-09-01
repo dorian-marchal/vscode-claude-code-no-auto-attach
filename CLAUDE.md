@@ -17,7 +17,8 @@ All logic is in [extension.js](extension.js) (no build step, no deps, no `node_m
 ## Updating anchors after a CC release
 
 Inspect the live bundle to rewrite regexes:
-`~/.vscode/extensions/anthropic.claude-code-<version>/...` (current: `2.1.198-darwin-arm64`).
+`~/.vscode/extensions/anthropic.claude-code-<version>/...` (current: `2.1.251-darwin-arm64`).
+Since 2.1.251 the minifier also uses `$` as a bare variable name — anchor regexes must use `[\w$]+`, never `\w+`, and every `String.replace` whose replacement embeds captured variable names must use the function form (`replace(x, () => y)`) so `$`-sequences aren't interpreted.
 
 ## Build / release
 
