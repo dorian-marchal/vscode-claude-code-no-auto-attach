@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v36*/';
+const MARKER = '/*claude-code-no-auto-attach:v37*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -146,14 +146,15 @@ const RATE_LIMIT_REVERT_RE =
 // session sets rateLimitWarning from every rate_limit_event, and each one costs a dismiss
 // click. Only the "rejected" status is kept — that one means the limit is actually hit, so
 // it stays worth showing. The original expression is parked inside the sentinel for a
-// byte-exact revert. Two bundle generations are handled: 2.1.251+ routes the event through
+// byte-exact revert. Three bundle generations are handled: 2.1.251+ routes the event through
 // a decision helper ("clear"/"show"/"keep-hidden") and builds the banner in the "show"
-// branch; older bundles assigned it directly behind a dismissedRateLimitKey check. Either
-// way the builder call is wrapped in the same sentinel conditional, so one revert regex
-// covers both.
+// branch — assigned directly to rateLimitWarning/shownRateLimitKey in 2.1.251, and since
+// 2.1.257 to frameRateLimitWarning/shownRateLimit inside a signal batch (`$H(()=>{…})`);
+// older bundles assigned it directly behind a dismissedRateLimitKey check. Either way the
+// builder call is wrapped in the same sentinel conditional, so one revert regex covers all.
 function injectHideRateLimitWarning(content) {
   const showBranchRe =
-    /else if\(([\w$]+)==="show"\)\{let ([\w$]+)=([\w$]+\(([\w$]+)\));this\.rateLimitWarning\.value=\2,this\.shownRateLimitKey=\2===null\?null:[\w$]+\(\4\)\}/g;
+    /else if\(([\w$]+)==="show"\)\{let ([\w$]+)=([\w$]+\(([\w$]+)\));(?:[\w$]+\(\(\)=>\{)?this\.(?:frame)?[rR]ateLimitWarning\.value=\2,this\.shownRateLimit(?:Key)?(?:\.value)?=\2===null\?null:/g;
   const showMatches = [...content.matchAll(showBranchRe)];
   if (showMatches.length === 1) {
     const [whole, , resultVar, call, infoVar] = showMatches[0];
@@ -504,9 +505,11 @@ const URI_OPEN_EXT_SENTINEL_RE = /\/\*__ccaaUriOpenExt\*\/[\s\S]*?\/\*__ccaaUriO
 function injectUriOpenInEditor(content) {
   // Anchor spans the tail of the /install-plugin case (to capture the webview-manager var
   // off its notifyOpenPluginsDialog call — the only manager reference in the handler) and
-  // the whole /open case.
+  // the whole /open case. 2.1.257 added a session-id validation between the parameter reads
+  // and the open call (`if(x!==void 0&&!SH(x))return;`); it is matched optionally and kept
+  // in place, so the injected code still runs after it.
   const anchorRe =
-    /([\w$]+)\.notifyOpenPluginsDialog\([\w$]+,[\w$]+\)\}\);return\}case"\/open":\{let ([\w$]+)=([\w$]+)\.get\("session"\)\?\?void 0,([\w$]+)=\3\.get\("prompt"\)\?\?void 0;([\w$]+)\.commands\.executeCommand\("claude-vscode\.primaryEditor\.open",\2,\4\);return\}/g;
+    /([\w$]+)\.notifyOpenPluginsDialog\([\w$]+,[\w$]+\)\}\);return\}case"\/open":\{let ([\w$]+)=([\w$]+)\.get\("session"\)\?\?void 0,([\w$]+)=\3\.get\("prompt"\)\?\?void 0;(?:if\(\2!==void 0&&![\w$]+\(\2\)\)return;)?([\w$]+)\.commands\.executeCommand\("claude-vscode\.primaryEditor\.open",\2,\4\);return\}/g;
   const matches = [...content.matchAll(anchorRe)];
   if (matches.length === 0) {
     return { ok: false, reason: 'uri /open handler not found (Claude Code internals may have changed)' };
@@ -644,9 +647,14 @@ const SESSION_EFFORT_SENTINEL_RE = /\/\*__ccaaSessionEffort\*\/[\s\S]*?\/\*__cca
 // guarded by flagsOnly), so the current session still gets the new effort. Effort-only means
 // the settings object's single key is "effortLevel" — the native effort picker and our
 // setEffortLevel both send exactly that; other apply_settings calls are left untouched.
+// Since 2.1.257 applySettings takes a 4th `scope` argument ("localSettings" writes the
+// project's settings.local.json and rejects flagsOnly), so the override only fires when no
+// scope is given — the effort picker never passes one.
 function injectSessionScopedEffort(content) {
+  // Anchor on the signature plus the immediate writeUserSettingsAndPush(channel,settings,flags…)
+  // call; the body around it differs between releases (`return await …` vs `if(await …`).
   const anchorRe =
-    /async applySettings\(([\w$]+),([\w$]+),([\w$]+)\)\{return await this\.writeUserSettingsAndPush\(\1,\2,\3\),\{type:"apply_settings_response"\}\}/g;
+    /async applySettings\(([\w$]+),([\w$]+),([\w$]+)(?:,([\w$]+))?\)\{(?=(?:return |if\()await this\.writeUserSettingsAndPush\(\1,\2,\3[,)])/g;
   const matches = [...content.matchAll(anchorRe)];
   if (matches.length === 0) {
     return { ok: false, reason: 'applySettings anchor not found (Claude Code internals may have changed)' };
@@ -655,18 +663,15 @@ function injectSessionScopedEffort(content) {
     return { ok: false, reason: `ambiguous: ${matches.length} applySettings anchors found` };
   }
 
-  const [anchor, channelVar, settingsVar, flagsVar] = matches[0];
+  const [anchor, , settingsVar, flagsVar, scopeVar] = matches[0];
+  const noScope = scopeVar ? `${scopeVar}===void 0&&` : '';
   const insertion =
-    `/*__ccaaSessionEffort*/try{if(!${flagsVar}&&${settingsVar}&&typeof ${settingsVar}==="object"){` +
+    `/*__ccaaSessionEffort*/try{if(!${flagsVar}&&${noScope}${settingsVar}&&typeof ${settingsVar}==="object"){` +
     `var __ccaaEffKeys=Object.keys(${settingsVar});` +
     `if(__ccaaEffKeys.length===1&&__ccaaEffKeys[0]==="effortLevel"&&` +
     `require("vscode").workspace.getConfiguration("claude-code-no-auto-attach").get("sessionScopedEffortSwitch",true))` +
     `${flagsVar}=!0}}catch(__ccaaEffErr){}/*__ccaaSessionEffortEnd*/`;
-  const replacement = anchor.replace(
-    `async applySettings(${channelVar},${settingsVar},${flagsVar}){`,
-    () => `async applySettings(${channelVar},${settingsVar},${flagsVar}){${insertion}`
-  );
-  return { ok: true, content: content.replace(anchor, () => replacement) };
+  return { ok: true, content: replaceMatch(content, matches[0], anchor + insertion) };
 }
 
 const MD_PREVIEW_SENTINEL_RE = /\/\*__ccaaMdPreview\*\/[\s\S]*?\/\*__ccaaMdPreviewEnd\*\//g;
@@ -699,7 +704,7 @@ function injectMarkdownPreviewContext(content) {
   // Capture the whole `X=void 0,` run so we can preserve it verbatim and stay tolerant of
   // future additions; the context var (whose `.filePath` the resolver sets) is the first one.
   const anchorRe =
-    /onDidChangeActiveTextEditor\(async\((\w+)\)=>\{if\(!\1\)\{if\((\w+)\(([\w$]+)\.window\.visibleTextEditors\.length\)==="retain"\)return;([\w$]+)\.bump\(\),((?:[\w$]+=void 0,)+)([\w$]+)\.fire\(void 0\);return\}/g;
+    /onDidChangeActiveTextEditor\(async\(([\w$]+)\)=>\{if\(!\1\)\{if\(([\w$]+)\(([\w$]+)\.window\.visibleTextEditors\.length\)==="retain"\)return;([\w$]+)\.bump\(\),((?:[\w$]+=void 0,)+)([\w$]+)\.fire\(void 0\);return\}/g;
   const matches = [...content.matchAll(anchorRe)];
   if (matches.length === 0) {
     return { ok: false, reason: 'active-editor handler not found (Claude Code internals may have changed)' };
