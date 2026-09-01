@@ -1,8 +1,8 @@
 {
   "name": "claude-code-no-auto-attach",
   "displayName": "Claude Code: No Auto-Attach",
-  "description": "Patches the Claude Code VS Code extension: auto-attach defaults to OFF (configurable), Ctrl+F context-attach toggle, session-scoped model switching, session-scoped effort switching, per-model effort presets (Fable high / Opus xhigh / Sonnet+Haiku medium), per-session model badge, Ctrl+M model cycling, Ctrl+0/1/2/3 send-with-Fable/Opus/Sonnet/Haiku shortcuts, Sonnet/Haiku/Fable quick-send buttons, capped/scrollable prompt bubbles, markdown-preview context attach. Re-applies automatically when Claude Code updates.",
-  "version": "0.6.8",
+  "description": "Patches the Claude Code VS Code extension: auto-attach defaults to OFF (configurable), Ctrl+F context-attach toggle, session-scoped model switching, session-scoped effort switching, per-model effort presets (Fable high / Opus xhigh / Sonnet+Haiku medium), per-session model badge, Ctrl+M model cycling, Ctrl+0/1/2/3 send-with-Fable/Opus/Sonnet/Haiku shortcuts, Sonnet/Haiku/Fable quick-send buttons, capped/scrollable prompt bubbles, markdown-preview context attach, vscode://…/open URIs open in the locked Claude editor group and auto-send their prompt. Re-applies automatically when Claude Code updates.",
+  "version": "0.6.11",
   "publisher": "dmarchal",
   "private": true,
   "license": "UNLICENSED",
@@ -45,6 +45,16 @@
           "type": "boolean",
           "default": true,
           "description": "Make model switching session-scoped: selecting a model in a Claude Code session no longer rewrites the global default in ~/.claude/settings.json. Toggle OFF temporarily if you want a model switch to become the new global default. Takes effect immediately, no reload needed."
+        },
+        "claude-code-no-auto-attach.uriOpensInEditor": {
+          "type": "boolean",
+          "default": true,
+          "description": "Make vscode://anthropic.claude-code/open?prompt=…&session=… URIs open/resume in the locked editor group you keep Claude Code in (creating and locking a side column when there is none) instead of hijacking the active editor group. The injected code reads the setting on every URI, so toggling takes effect immediately, no reload needed."
+        },
+        "claude-code-no-auto-attach.uriAutoSendsPrompt": {
+          "type": "boolean",
+          "default": true,
+          "description": "When a vscode://anthropic.claude-code/open URI carries a prompt (and uriOpensInEditor is on), send it right away instead of just typing it into the composer. Waits for the session to be idle; gives up after 30s and leaves the prompt typed."
         },
         "claude-code-no-auto-attach.sessionScopedEffortSwitch": {
           "type": "boolean",

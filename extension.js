@@ -424,10 +424,145 @@ function injectSendModelButtons(content) {
   return { ok: true, content: content.replace(anchor, () => anchor + insertion) };
 }
 
+const URI_OPEN_WV_SENTINEL_RE = /\/\*__ccaaUriOpenWv\*\/[\s\S]*?\/\*__ccaaUriOpenWvEnd\*\//g;
+
+// Companion of the extension.js uri-open-in-editor patch. Chat panels (never the side bar)
+// listen for the custom top-level "ccaa-open" window message the extension posts when a
+// vscode://anthropic.claude-code/open URI arrives. The extension has already opened/revealed
+// the panel with the right session, so this listener only finishes the job: it types the
+// prompt when the extension could not hand it to the stock panel (session was already open),
+// and — when autoSend is set — submits the composer once the prompt has been typed and the
+// session is idle. `match` is the URI's session id: the message is ignored until the panel
+// actually shows that session, which is how a broadcast (used when the panel already existed)
+// still lands in exactly one panel. `strict` marks that broadcast: the match then has 5s to
+// happen, otherwise this panel is not the target. A nonce set dedupes the delivery retries.
+// Injected at the app bootstrap, the one spot where the session store is in scope.
+function injectUriOpenListener(content) {
+  const anchorRe = /([\w$]+)\.listSessions\("panel_boot"\)\.then/g;
+  const matches = [...content.matchAll(anchorRe)];
+  if (matches.length === 0) {
+    return { ok: false, reason: 'panel_boot bootstrap not found (Claude Code internals may have changed)' };
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${matches.length} panel_boot bootstraps found` };
+  }
+
+  const [whole, storeVar] = matches[0];
+  const insertion =
+    `/*__ccaaUriOpenWv*/try{if(!window.IS_SIDEBAR&&!globalThis.__ccaaUriOpenBound){globalThis.__ccaaUriOpenBound=!0;` +
+    `var __ccaaUriSeen=new Set;` +
+    `window.addEventListener("message",(__ccaaUriEv)=>{try{` +
+    `var __ccaaUriMsg=__ccaaUriEv.data;` +
+    `if(!__ccaaUriMsg||__ccaaUriMsg.type!=="ccaa-open")return;` +
+    `var __ccaaUriPrompt=typeof __ccaaUriMsg.prompt==="string"&&__ccaaUriMsg.prompt?__ccaaUriMsg.prompt:void 0;` +
+    `if(!__ccaaUriPrompt)return;` +
+    `if(__ccaaUriMsg.nonce){if(__ccaaUriSeen.has(__ccaaUriMsg.nonce))return;__ccaaUriSeen.add(__ccaaUriMsg.nonce)}` +
+    `var __ccaaUriT0=Date.now(),__ccaaUriSess,__ccaaUriTyped=!1;` +
+    `var __ccaaUriTimer=setInterval(()=>{try{` +
+    `if(Date.now()-__ccaaUriT0>30000){clearInterval(__ccaaUriTimer);return}` +
+    `var __ccaaUriCur=${storeVar}.activeSession.value;` +
+    // Not our panel (or not ready yet): a broadcast only waits 5s for the session to show up.
+    `if(!__ccaaUriCur||__ccaaUriMsg.match&&__ccaaUriCur.sessionId.value!==String(__ccaaUriMsg.match)){` +
+    `if(__ccaaUriMsg.strict&&Date.now()-__ccaaUriT0>5000)clearInterval(__ccaaUriTimer);return}` +
+    `if(__ccaaUriSess&&__ccaaUriCur!==__ccaaUriSess){clearInterval(__ccaaUriTimer);return}` +
+    `__ccaaUriSess=__ccaaUriCur;` +
+    `if(__ccaaUriMsg.typePrompt&&!__ccaaUriTyped){__ccaaUriTyped=!0;__ccaaUriSess.initialPrompt.value=__ccaaUriPrompt;return}` +
+    `if(!__ccaaUriMsg.autoSend){clearInterval(__ccaaUriTimer);return}` +
+    // Wait for the prompt to reach the composer (initialPrompt consumed) and the session to idle.
+    `if(__ccaaUriSess.initialPrompt.value!==void 0||__ccaaUriSess.busy.value)return;` +
+    `var __ccaaUriBtn=document.querySelector('button[type="submit"][data-permission-mode]');` +
+    `if(!__ccaaUriBtn||__ccaaUriBtn.disabled||!__ccaaUriBtn.form)return;` +
+    `clearInterval(__ccaaUriTimer);__ccaaUriBtn.form.requestSubmit()` +
+    `}catch(__ccaaUriE1){clearInterval(__ccaaUriTimer)}},250)` +
+    `}catch(__ccaaUriE2){}})}}catch(__ccaaUriE3){}/*__ccaaUriOpenWvEnd*/`;
+
+  return { ok: true, content: replaceMatch(content, matches[0], insertion + whole) };
+}
+
 // --- extension.js sub-patches ---
 
+const URI_OPEN_EXT_SENTINEL_RE = /\/\*__ccaaUriOpenExt\*\/[\s\S]*?\/\*__ccaaUriOpenExtEnd\*\//g;
+
+// vscode://anthropic.claude-code/open?prompt=…&session=… normally opens the session with
+// claude-vscode.primaryEditor.open, i.e. in the *active* editor group (ViewColumn.Active) —
+// so a URI hijacks whatever group you were working in. Route it through
+// claude-vscode.editor.open instead — the command behind "open Claude in an editor" — with
+// the target column resolved here (stock's own "a group whose tabs are all Claude panels"
+// rule loses the group as soon as a file is dropped in it) and a lock afterwards, so a
+// session always lands in the locked Claude group. It also only types the prompt, so a
+// "ccaa-open" message is posted to the target panel's webview, whose injected listener (see
+// injectUriOpenListener) submits it. Delivery is retried for ~15s because the panel may still
+// be booting; the listener's nonce set makes retries idempotent.
+//
+// The target is the webview added by the open call (diffing the manager's webview set), which
+// pins the message to exactly one panel. When the session already had a panel, none is added:
+// the panel is only revealed, and the stock command drops the prompt ("Session is already
+// open…"), so the prompt is withheld from it (no warning), the message carries typePrompt and
+// is broadcast to the chat webviews, and the session id in `match` picks the single panel
+// showing it. The original primaryEditor.open call is kept as the fallback when the setting is
+// off or anything throws.
+function injectUriOpenInEditor(content) {
+  // Anchor spans the tail of the /install-plugin case (to capture the webview-manager var
+  // off its notifyOpenPluginsDialog call — the only manager reference in the handler) and
+  // the whole /open case.
+  const anchorRe =
+    /([\w$]+)\.notifyOpenPluginsDialog\([\w$]+,[\w$]+\)\}\);return\}case"\/open":\{let ([\w$]+)=([\w$]+)\.get\("session"\)\?\?void 0,([\w$]+)=\3\.get\("prompt"\)\?\?void 0;([\w$]+)\.commands\.executeCommand\("claude-vscode\.primaryEditor\.open",\2,\4\);return\}/g;
+  const matches = [...content.matchAll(anchorRe)];
+  if (matches.length === 0) {
+    return { ok: false, reason: 'uri /open handler not found (Claude Code internals may have changed)' };
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${matches.length} uri /open handlers found` };
+  }
+
+  const [whole, managerVar, sessionVar, , promptVar, vscodeNs] = matches[0];
+  const originalTail = `${vscodeNs}.commands.executeCommand("claude-vscode.primaryEditor.open",${sessionVar},${promptVar});return}`;
+  const insertion =
+    `/*__ccaaUriOpenExt*/try{` +
+    `var __ccaaUriCfg=require("vscode").workspace.getConfiguration("claude-code-no-auto-attach");` +
+    `if(__ccaaUriCfg.get("uriOpensInEditor",true)){` +
+    `var __ccaaUriViews=${managerVar}.webviews,__ccaaUriBefore=new Set(__ccaaUriViews),__ccaaUriReopen=!1;` +
+    `try{__ccaaUriReopen=!!${sessionVar}&&${managerVar}.sessionPanels.has(${sessionVar})}catch(__ccaaUriE1){}` +
+    `var __ccaaUriIsCC=(__ccaaUriTab)=>__ccaaUriTab.input instanceof ${vscodeNs}.TabInputWebview&&` +
+    `__ccaaUriTab.input.viewType.includes("claudeVSCodePanel");` +
+    // Pick the Claude group ourselves: stock only reuses a group whose tabs are *all* Claude
+    // panels, so one dropped file sends the session to a brand-new column. A group holding a
+    // session is the Claude group whatever else sits in it (most sessions wins, then
+    // rightmost); failing that, a group that is open but empty — VS Code only keeps those
+    // around when they are locked, which is the empty Claude group waiting for a session.
+    // Nothing found: leave the column undefined and let stock create and lock one.
+    `var __ccaaUriCol=void 0;try{var __ccaaUriGroups=${vscodeNs}.window.tabGroups.all,__ccaaUriBest=0;` +
+    `for(var __ccaaUriG of __ccaaUriGroups){var __ccaaUriN=__ccaaUriG.tabs.filter(__ccaaUriIsCC).length;` +
+    `if(__ccaaUriN>0&&__ccaaUriN>=__ccaaUriBest){__ccaaUriBest=__ccaaUriN;__ccaaUriCol=__ccaaUriG.viewColumn}}` +
+    `if(__ccaaUriCol===void 0&&__ccaaUriGroups.length>1)for(var __ccaaUriG2 of __ccaaUriGroups)` +
+    `if(__ccaaUriG2.tabs.length===0)__ccaaUriCol=__ccaaUriG2.viewColumn}catch(__ccaaUriE5){}` +
+    `var __ccaaUriPayload={type:"ccaa-open",prompt:${promptVar}??null,match:${sessionVar}??null,` +
+    `typePrompt:__ccaaUriReopen,strict:!1,autoSend:!!__ccaaUriCfg.get("uriAutoSendsPrompt",true),` +
+    `nonce:Date.now()+"-"+Math.random()};` +
+    `Promise.resolve(${vscodeNs}.commands.executeCommand("claude-vscode.editor.open",${sessionVar},` +
+    `__ccaaUriReopen?void 0:${promptVar},__ccaaUriCol)).then(()=>{try{` +
+    // Claude groups are meant to stay locked; stock only locks a group it had to create. The
+    // panel takes focus, so the group it landed in is the active one, and locking is a no-op
+    // when it already is. Never the last remaining group — locking that one traps the editor.
+    `try{var __ccaaUriGroup=${vscodeNs}.window.tabGroups.activeTabGroup;` +
+    `if(${vscodeNs}.window.tabGroups.all.length>1&&__ccaaUriGroup&&__ccaaUriGroup.tabs.some(__ccaaUriIsCC))` +
+    `${vscodeNs}.commands.executeCommand("workbench.action.lockEditorGroup")}catch(__ccaaUriE4){}` +
+    `if(!${promptVar})return;` +
+    `var __ccaaUriAll=[...__ccaaUriViews].filter((__ccaaUriV)=>__ccaaUriV.isChatSurface);` +
+    `var __ccaaUriTargets=__ccaaUriAll.filter((__ccaaUriV)=>!__ccaaUriBefore.has(__ccaaUriV));` +
+    `if(__ccaaUriTargets.length!==1){if(!__ccaaUriPayload.match)return;__ccaaUriTargets=__ccaaUriAll;__ccaaUriPayload.strict=!0}` +
+    `var __ccaaUriTries=0;` +
+    `var __ccaaUriTick=()=>{__ccaaUriTries++;` +
+    `for(var __ccaaUriView of __ccaaUriTargets)try{__ccaaUriView.comms.webview.postMessage(__ccaaUriPayload)}catch(__ccaaUriE2){}` +
+    `if(__ccaaUriTries<30)setTimeout(__ccaaUriTick,500)};` +
+    `__ccaaUriTick()}catch(__ccaaUriE3){}},()=>{});` +
+    `return}}catch(__ccaaUriE0){}/*__ccaaUriOpenExtEnd*/`;
+
+  return { ok: true, content: replaceMatch(content, matches[0], whole.replace(originalTail, () => insertion + originalTail)) };
+}
+
 function injectCanUseToolGuard(content) {
-  const anchorRe = /if\((\w+)\.request\.subtype==="can_use_tool"\)\{if\(!this\.canUseTool\)throw Error\("canUseTool callback is not provided\."\);/g;
+  const anchorRe = /if\(([\w$]+)\.request\.subtype==="can_use_tool"\)\{if\(!this\.canUseTool\)throw Error\("canUseTool callback is not provided\."\);/g;
   const matches = [...content.matchAll(anchorRe)];
   if (matches.length === 0) {
     return { ok: false, reason: 'can_use_tool anchor not found (Claude Code internals may have changed)' };
@@ -648,7 +783,8 @@ function computeWebviewPatch(content, { detachContextByDefault = true } = {}) {
     { name: 'context-toggle-shortcut', inject: injectContextToggleShortcut },
     { name: 'slash-keeps-selection', inject: injectSlashKeepsSelection },
     { name: 'send-model-buttons', inject: injectSendModelButtons },
-    { name: 'hide-rate-limit-warning', inject: injectHideRateLimitWarning }
+    { name: 'hide-rate-limit-warning', inject: injectHideRateLimitWarning },
+    { name: 'uri-open-listener', inject: injectUriOpenListener }
   );
   return runSubPatches(content, subPatches);
 }
@@ -665,6 +801,7 @@ function revertWebviewPatch(content) {
   next = revertAttachToggleOff(next);
   next = next.replace(MODEL_UI_SENTINEL_RE, '');
   next = next.replace(SEND_MODEL_BUTTONS_SENTINEL_RE, '');
+  next = next.replace(URI_OPEN_WV_SENTINEL_RE, '');
   return { reverted: true, content: next };
 }
 
@@ -707,6 +844,7 @@ function computeExtensionPatch(content) {
     { name: 'session-scoped-model', inject: injectSessionScopedModel },
     { name: 'session-scoped-effort', inject: injectSessionScopedEffort },
     { name: 'markdown-preview-context', inject: injectMarkdownPreviewContext },
+    { name: 'uri-open-in-editor', inject: injectUriOpenInEditor },
   ]);
 }
 
@@ -721,6 +859,7 @@ function revertExtensionPatch(content) {
   next = next.replace(MD_PREVIEW_SENTINEL_RE, '');
   next = next.replace(MD_PREVIEW2_SENTINEL_RE, '');
   next = next.replace(MD_PREVIEW3_SENTINEL_RE, '');
+  next = next.replace(URI_OPEN_EXT_SENTINEL_RE, '');
   return { reverted: true, content: next };
 }
 
@@ -728,7 +867,7 @@ const PATCH_SITES = [
   {
     relativePath: ['webview', 'index.js'],
     description:
-      'attach toggle OFF + per-session model badge + Ctrl+M model cycle + Ctrl+F context toggle + hide rate-limit warnings',
+      'attach toggle OFF + per-session model badge + Ctrl+M model cycle + Ctrl+F context toggle + hide rate-limit warnings + uri-open panel listener',
     compute: computeWebviewPatch,
     revert: revertWebviewPatch,
   },
@@ -740,7 +879,7 @@ const PATCH_SITES = [
   },
   {
     relativePath: ['extension.js'],
-    description: 'auto-allow gitignored Write/Edit prompts (bypass mode only) + capture permission mode + session-scoped model + session-scoped effort switch',
+    description: 'auto-allow gitignored Write/Edit prompts (bypass mode only) + capture permission mode + session-scoped model + session-scoped effort switch + uri /open in the Claude editor group',
     compute: computeExtensionPatch,
     revert: revertExtensionPatch,
   },
