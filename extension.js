@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v37*/';
+const MARKER = '/*claude-code-no-auto-attach:v39*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -480,6 +480,37 @@ function injectUriOpenListener(content) {
   return { ok: true, content: replaceMatch(content, matches[0], insertion + whole) };
 }
 
+const MOUNT_FOCUS_REVERT_RE = /\/\*__ccaaMountFocus:([^*]*)\*\/[\w$]+\.current\?\.focus\(\)/;
+
+// Since 2.1.257 the effect that focuses the composer when a session mounts (new panel, session
+// switch) is gated on `ambientFocusAllowed()`, i.e. `document.hasFocus()`. A freshly opened
+// Claude tab never satisfies it: VS Code's focus lands on the webview shell before the app's
+// iframe exists, so the document never reports focus and the one-shot attempt is dropped —
+// the composer stays unfocused. Up to 2.1.233 the effect called the composer's focus directly
+// (still through `safeFocus`, which only checks the connection's `isVisible`), and a plain
+// `element.focus()` pulls focus into the webview by itself. Restore that call: the gate wrapper
+// is parked in a sentinel comment for a byte-exact revert. Nothing else about the effect
+// changes — it still bails when an input already has focus.
+function injectSessionMountFocus(content) {
+  const anchorRe =
+    /if\(([\w$]+)\(document\.activeElement\)\)return;([\w$]+\(\(\)=>([\w$]+\.current\?\.focus\(\)),\(\)=>([\w$]+)\.ambientFocusAllowed\(\)\))\},\[\4,[\w$]+\.sessionId\.value\]\)/g;
+  const matches = [...content.matchAll(anchorRe)];
+  if (matches.length === 0) {
+    return { ok: false, reason: 'session-mount focus effect not found (Claude Code internals may have changed)' };
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${matches.length} session-mount focus effects found` };
+  }
+
+  const [whole, , gatedCall, focusCall] = matches[0];
+  const replaced = whole.replace(gatedCall, () => `/*__ccaaMountFocus:${gatedCall}*/${focusCall}`);
+  return { ok: true, content: replaceMatch(content, matches[0], replaced) };
+}
+
+function revertSessionMountFocus(content) {
+  return MOUNT_FOCUS_REVERT_RE.test(content) ? content.replace(MOUNT_FOCUS_REVERT_RE, (_, original) => original) : content;
+}
+
 // --- extension.js sub-patches ---
 
 const URI_OPEN_EXT_SENTINEL_RE = /\/\*__ccaaUriOpenExt\*\/[\s\S]*?\/\*__ccaaUriOpenExtEnd\*\//g;
@@ -789,7 +820,8 @@ function computeWebviewPatch(content, { detachContextByDefault = true } = {}) {
     { name: 'slash-keeps-selection', inject: injectSlashKeepsSelection },
     { name: 'send-model-buttons', inject: injectSendModelButtons },
     { name: 'hide-rate-limit-warning', inject: injectHideRateLimitWarning },
-    { name: 'uri-open-listener', inject: injectUriOpenListener }
+    { name: 'uri-open-listener', inject: injectUriOpenListener },
+    { name: 'session-mount-focus', inject: injectSessionMountFocus }
   );
   return runSubPatches(content, subPatches);
 }
@@ -803,6 +835,7 @@ function revertWebviewPatch(content) {
   let next = revertContextToggle(stripped);
   next = revertSlashKeepsSelection(next);
   next = revertHideRateLimitWarning(next);
+  next = revertSessionMountFocus(next);
   next = revertAttachToggleOff(next);
   next = next.replace(MODEL_UI_SENTINEL_RE, '');
   next = next.replace(SEND_MODEL_BUTTONS_SENTINEL_RE, '');
