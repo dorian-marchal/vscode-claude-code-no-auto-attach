@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const vscode = require('vscode');
 
 const MARKER = '/*claude-code-no-auto-attach:v39*/';
@@ -947,6 +948,27 @@ function findClaudeExtensionDirs() {
   return dirs.length ? dirs : [ext.extensionPath];
 }
 
+// Hash of each target file as it stood the first time this window looked at it — i.e.
+// what the Claude Code extension host running in this window actually loaded. Patches
+// written afterwards (by another window, or by a new build of this extension) change
+// the file but not the running code, so any divergence from this snapshot means the
+// window is running stale Claude Code code and must be reloaded.
+const loadedBundleHashes = new Map();
+let reloadPromptShown = false;
+
+function hashContent(content) {
+  return crypto.createHash('sha1').update(content).digest('hex');
+}
+
+async function promptReload(message) {
+  if (reloadPromptShown) return;
+  reloadPromptShown = true;
+  const action = await vscode.window.showInformationMessage(message, 'Reload Window', 'Later');
+  if (action === 'Reload Window') {
+    vscode.commands.executeCommand('workbench.action.reloadWindow');
+  }
+}
+
 async function applyPatch(channel, { interactive = false } = {}) {
   const dirs = findClaudeExtensionDirs();
   if (dirs.length === 0) {
@@ -958,6 +980,7 @@ async function applyPatch(channel, { interactive = false } = {}) {
   }
 
   let anyApplied = false;
+  let anyStale = false;
   const skipMessages = [];
 
   const config = vscode.workspace.getConfiguration('claude-code-no-auto-attach');
@@ -978,6 +1001,14 @@ async function applyPatch(channel, { interactive = false } = {}) {
         continue;
       }
 
+      if (!loadedBundleHashes.has(filePath)) {
+        loadedBundleHashes.set(filePath, hashContent(content));
+      }
+      const loadedHash = loadedBundleHashes.get(filePath);
+      const markStale = (finalContent) => {
+        if (hashContent(finalContent) !== loadedHash) anyStale = true;
+      };
+
       const reverted = site.revert(content);
       const baseContent = reverted.reverted ? reverted.content : content;
 
@@ -985,6 +1016,7 @@ async function applyPatch(channel, { interactive = false } = {}) {
       if (!result.patched) {
         channel.appendLine(`[no-auto-attach] Skipped ${relLabel} (${result.reason}).`);
         skipMessages.push(`${relLabel}: ${result.reason}`);
+        markStale(content);
         continue;
       }
 
@@ -995,6 +1027,7 @@ async function applyPatch(channel, { interactive = false } = {}) {
 
       if (result.content === content) {
         channel.appendLine(`[no-auto-attach] Skipped ${relLabel} (already at current version).`);
+        markStale(content);
         continue;
       }
 
@@ -1008,18 +1041,19 @@ async function applyPatch(channel, { interactive = false } = {}) {
 
       channel.appendLine(`[no-auto-attach] Patched ${filePath} (${site.description}).`);
       anyApplied = true;
+      markStale(result.content);
     }
   }
 
   if (anyApplied) {
-    const action = await vscode.window.showInformationMessage(
-      'Claude Code patches applied. Reload window to take effect.',
-      'Reload Window',
-      'Later'
-    );
-    if (action === 'Reload Window') {
-      vscode.commands.executeCommand('workbench.action.reloadWindow');
-    }
+    // A fresh write is worth re-asking about even if an earlier prompt was dismissed.
+    reloadPromptShown = false;
+    await promptReload('Claude Code patches applied. Reload window to take effect.');
+  } else if (anyStale) {
+    // Someone else (another window, or a new build of this extension) rewrote the bundle
+    // after this window's Claude Code extension host loaded it.
+    channel.appendLine('[no-auto-attach] Patched files changed since this window loaded them.');
+    await promptReload('Claude Code patches changed on disk. Reload window to run them.');
   } else if (interactive) {
     vscode.window.showInformationMessage(
       `No patches applied. ${skipMessages.join('; ') || 'See output channel for details.'}`

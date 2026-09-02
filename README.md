@@ -61,7 +61,7 @@ Each patched file is prefixed with a versioned marker so re-launches don't re-pa
 - ⚠️ `autoApproveProtectedPathWrites` bypasses Claude Code's protected-path safety check (covering `.claude/`, `~/.claude/settings.json`, etc.). Don't enable it in workspaces where you don't fully trust the agent.
 - The model badge, `Ctrl+M`, `Ctrl+0/1/2/3`, and `Ctrl+F` handlers live inside the Claude webview, so the shortcuts only fire when a Claude session has focus (that's also what makes them target the right session). They're captured there (capture-phase + `preventDefault`), so while the session is focused `Ctrl+F` won't reach VS Code's find and `Ctrl+0/1/2/3` won't reach VS Code's focus-editor-group.
 - The markdown-preview resolver re-runs both when focus moves from a text editor to a preview and when you switch directly between preview tabs (it also listens to active-tab changes, not just active-text-editor changes). Two identically-named `.md` files that are both closed can't be disambiguated by the tab label — in that case it falls back to upstream's clear/retain behavior.
-- A window reload is required after the patch is applied; the extension will prompt you.
+- A window reload is required after the patch is applied; the extension will prompt you. Every window checks the patched files against the state they were in when its Claude Code host loaded them, so a window that was already open when another window (or a new build of this extension) rewrote the bundle is also prompted — without it that window keeps running the old, unpatched Claude Code code and features like the session-scoped effort switch silently look broken.
 
 ## Install
 
