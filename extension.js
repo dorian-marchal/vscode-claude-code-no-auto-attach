@@ -3,7 +3,7 @@ const path = require('path');
 const crypto = require('crypto');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v39*/';
+const MARKER = '/*claude-code-no-auto-attach:v40*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -863,6 +863,14 @@ function computePromptHeightPatch(content) {
     `\n/*__ccaaPromptHeight*/` +
     `[class*="userMessage_"]{max-height:40vh;overflow-y:auto;scrollbar-width:thin}` +
     `button[title^="Showing Claude your current file selection"]{color:#d97757}` +
+    // Keep the model picker on the composer footer row. The footer measures its
+    // children and, once they no longer fit, moves the model pill to a row of its
+    // own. Upstream caps the file-selection label at 200px, which — with the extra
+    // send buttons this extension injects — is enough to overflow a narrow panel on
+    // a long file name. A viewport-relative cap makes the label give way first: the
+    // name is elided (the full path stays in the button tooltip) instead of the
+    // whole picker wrapping. Pure CSS, so it is a no-op if the footer changes.
+    `[class*="footerButton_"]>span{max-width:min(200px,14vw)}` +
     `/*__ccaaPromptHeightEnd*/`;
   return { patched: true, content: MARKER + '\n' + content + css };
 }
@@ -912,7 +920,7 @@ const PATCH_SITES = [
   },
   {
     relativePath: ['webview', 'index.css'],
-    description: 'cap user prompt bubble height + make it scrollable',
+    description: 'cap user prompt bubble height + make it scrollable + keep the model picker on the footer row',
     compute: computePromptHeightPatch,
     revert: revertPromptHeightPatch,
   },
