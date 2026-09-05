@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const vm = require('vm');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v42*/';
+const MARKER = '/*claude-code-no-auto-attach:v43*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -231,59 +231,51 @@ function injectModelUi(content) {
   const [anchor, , sessionVar, nameVar, openPickerVar] = matches[0];
   const insertion =
     `;/*__ccaaModelUi*/try{` +
-    // The badge is a flex row of three spans: the served-model pill, an arrow, and the
-    // selected-model pill. Only the last one shows unless the two disagree (see drift below).
+    // A single pill. Older builds rendered three spans (served → selected); rebuild those.
     `var __ccaaBadge=document.getElementById("ccaa-model-badge");` +
-    `if(__ccaaBadge&&!document.getElementById("ccaa-model-badge-main")){__ccaaBadge.remove();__ccaaBadge=null}` +
+    `if(__ccaaBadge&&(!document.getElementById("ccaa-model-badge-main")||document.getElementById("ccaa-model-badge-served"))){__ccaaBadge.remove();__ccaaBadge=null}` +
     `if(!__ccaaBadge){__ccaaBadge=document.createElement("div");__ccaaBadge.id="ccaa-model-badge";` +
-    `__ccaaBadge.style.cssText="position:fixed;top:36px;right:14px;z-index:99999;display:flex;align-items:center;gap:4px;font-size:11px;font-family:var(--vscode-font-family);line-height:16px;cursor:pointer;user-select:none;opacity:.95";` +
-    `["ccaa-model-badge-served","ccaa-model-badge-arrow","ccaa-model-badge-main"].forEach((__ccaaId)=>{` +
-    `var __ccaaSpan=document.createElement("span");__ccaaSpan.id=__ccaaId;` +
-    `__ccaaSpan.style.cssText=__ccaaId==="ccaa-model-badge-arrow"?"color:var(--vscode-descriptionForeground,#999)":"padding:1px 8px;border-radius:9px";` +
-    `__ccaaBadge.appendChild(__ccaaSpan)});` +
+    `__ccaaBadge.style.cssText="position:fixed;top:36px;right:14px;z-index:99999;display:flex;align-items:center;font-size:11px;font-family:var(--vscode-font-family);line-height:16px;cursor:pointer;user-select:none;opacity:.95";` +
+    `var __ccaaSpan=document.createElement("span");__ccaaSpan.id="ccaa-model-badge-main";` +
+    `__ccaaSpan.style.cssText="padding:1px 8px;border-radius:9px";__ccaaBadge.appendChild(__ccaaSpan);` +
     `document.body.appendChild(__ccaaBadge)}` +
     `__ccaaBadge.onclick=()=>${openPickerVar}(!0);` +
-    `var __ccaaServedEl=document.getElementById("ccaa-model-badge-served");` +
-    `var __ccaaArrowEl=document.getElementById("ccaa-model-badge-arrow");` +
     `var __ccaaMainEl=document.getElementById("ccaa-model-badge-main");` +
     `var __ccaaModels=${sessionVar}.claudeConfig.value?.models??[];` +
     `var __ccaaSelected=${sessionVar}.modelSelection.value??"default";` +
     `var __ccaaSelModel=__ccaaModels.find((__ccaaM)=>__ccaaM.value===__ccaaSelected);` +
-    // lastServedModel is the model that actually answered, and upstream clears it inside
-    // setModel — so right after a switch there is no known mismatch, only once an answer
-    // comes back. currentMainLoopModel keeps the pre-switch value instead, which is why it
-    // must not feed the drift check (it made every switch look like a mismatch); it only
-    // serves as a color hint when the selection carries no family (e.g. "default").
+    // What the session runs is the model that last answered (lastServedModel): upstream
+    // clears it inside setModel, so while it is set no switch has been requested since and
+    // the next answer comes from that same model. modelSelection cannot be trusted for
+    // that: it is seeded from the *global* default on launch, which the session-scoped
+    // switch never writes, so a resumed Fable session reads "opus" while the CLI keeps
+    // serving Fable. When the two families disagree the badge therefore shows the served
+    // model (as upstream's own footer label does) and only mentions the picker's value in
+    // the tooltip. currentMainLoopModel keeps the pre-switch value, so it is only a color
+    // hint when neither carries a family (e.g. "default").
     `var __ccaaServed=String(${sessionVar}.lastServedModel?.value??"");` +
     `var __ccaaRunning=String(${sessionVar}.currentMainLoopModel?.value??"");` +
     `var __ccaaFamOf=(__ccaaS)=>(String(__ccaaS??"").toLowerCase().match(/fable|opus|sonnet|haiku/)??[null])[0];` +
     `var __ccaaSelFam=__ccaaFamOf(__ccaaSelected+" "+(__ccaaSelModel?.displayName??""));` +
     `var __ccaaServedFam=__ccaaFamOf(__ccaaServed);` +
-    // Drift: the last answer came from another family than the selected model, and no switch
-    // has been requested since. Upstream's label (nameVar) then reads the *served* model, so a
-    // single badge would mix that text with the selected model's color; show both pills
-    // instead — served first and dimmed, then the selected one.
     `var __ccaaDrift=!!(__ccaaSelFam&&__ccaaServedFam&&__ccaaSelFam!==__ccaaServedFam);` +
-    `var __ccaaLabel=(__ccaaDrift?null:${nameVar})??__ccaaSelModel?.displayName??__ccaaSelected;` +
-    // Name each pill from its own model, never from nameVar, which names the selected model
-    // or the served one depending on upstream's own drift rule.
-    `var __ccaaServedLabel=__ccaaModels.find((__ccaaM)=>__ccaaM.value===__ccaaServedFam)?.displayName??__ccaaServedFam;` +
-    // Append the current effort to the badge when the model supports it (reading these
+    `var __ccaaServedModel=__ccaaModels.find((__ccaaM)=>__ccaaM.resolvedModel===__ccaaServed)??__ccaaModels.find((__ccaaM)=>__ccaaM.value===__ccaaServedFam);` +
+    `var __ccaaShownModel=__ccaaDrift?__ccaaServedModel:__ccaaSelModel;` +
+    `var __ccaaLabel=__ccaaDrift?(__ccaaServedModel?.displayName??__ccaaServedFam):(${nameVar}??__ccaaSelModel?.displayName??__ccaaSelected);` +
+    `var __ccaaSelLabel=__ccaaSelModel?.displayName??__ccaaSelected;` +
+    // Append the current effort to the badge when the shown model supports it (reading these
     // reactive signals also re-runs this effect on effort changes, keeping the badge live).
     // Ultracode is xhigh + workflows, so show "ultra" rather than the bare "xhigh".
-    `var __ccaaEffort=(${sessionVar}.currentModelSupportsEffort?.value&&${sessionVar}.effortLevel?.value)?String(${sessionVar}.effortLevel.value):"";` +
+    `var __ccaaSupportsEffort=__ccaaShownModel?__ccaaShownModel.supportsEffort:${sessionVar}.currentModelSupportsEffort?.value;` +
+    `var __ccaaEffort=(__ccaaSupportsEffort&&${sessionVar}.effortLevel?.value)?String(${sessionVar}.effortLevel.value):"";` +
     `if(__ccaaEffort&&${sessionVar}.ultracodeEnabled?.value)__ccaaEffort="ultra";` +
     `var __ccaaColorOf=(__ccaaF)=>__ccaaF==="fable"?"#8052d2":__ccaaF==="opus"?"#c63e3e":__ccaaF==="sonnet"?"#bc8e26":__ccaaF==="haiku"?"#269473":null;` +
-    `var __ccaaPaint=(__ccaaEl,__ccaaC)=>{__ccaaEl.style.background=__ccaaC??"var(--vscode-badge-background,#4d4d4d)";` +
-    `__ccaaEl.style.color=__ccaaC?"#fff":"var(--vscode-badge-foreground,#fff)"};` +
+    `var __ccaaColor=__ccaaColorOf(__ccaaServedFam??__ccaaSelFam??__ccaaFamOf(__ccaaRunning));` +
+    `__ccaaMainEl.style.background=__ccaaColor??"var(--vscode-badge-background,#4d4d4d)";` +
+    `__ccaaMainEl.style.color=__ccaaColor?"#fff":"var(--vscode-badge-foreground,#fff)";` +
     `__ccaaMainEl.textContent=__ccaaEffort?String(__ccaaLabel)+" \xB7 "+__ccaaEffort:String(__ccaaLabel);` +
-    `__ccaaPaint(__ccaaMainEl,__ccaaColorOf(__ccaaSelFam??__ccaaServedFam??__ccaaFamOf(__ccaaRunning)));` +
-    `__ccaaServedEl.style.display=__ccaaArrowEl.style.display=__ccaaDrift?"":"none";` +
-    `if(__ccaaDrift){__ccaaArrowEl.textContent="\u2192";__ccaaServedEl.style.opacity=".6";` +
-    `__ccaaServedEl.textContent=String(__ccaaServedLabel);__ccaaPaint(__ccaaServedEl,__ccaaColorOf(__ccaaServedFam))}` +
-    `__ccaaBadge.title=(__ccaaDrift` +
-    `?"Last answered by "+String(__ccaaServedLabel)+", while "+String(__ccaaLabel)+(__ccaaEffort?" \xB7 "+__ccaaEffort:"")+" is selected \u2014 pick it again to apply it"` +
-    `:__ccaaEffort?"Claude model + effort ("+String(__ccaaLabel)+" \xB7 "+__ccaaEffort+")":"Claude model")` +
+    `__ccaaBadge.title=(__ccaaEffort?"Claude model + effort ("+String(__ccaaLabel)+" \xB7 "+__ccaaEffort+")":"Claude model ("+String(__ccaaLabel)+")")` +
+    `+(__ccaaDrift?" — the picker shows "+String(__ccaaSelLabel)+", your default, which was never applied to this session":"")` +
     `+" (click to switch, Ctrl+M to cycle)";` +
     // Map a model to the effort we want for its family (Fable->high, Opus->xhigh,
     // Sonnet/Haiku->medium), but only if the model reports it supports that level — else
