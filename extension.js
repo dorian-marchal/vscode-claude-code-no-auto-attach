@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const vm = require('vm');
 const vscode = require('vscode');
 
 const MARKER = '/*claude-code-no-auto-attach:v42*/';
@@ -808,19 +809,29 @@ function injectMarkdownPreviewContext(content) {
 
 // --- per-file compute/revert ---
 
+// Apply the sub-patches one by one. Each result is parsed before it is kept: an anchor can
+// still match after the code around it changed shape, and one such injection must only
+// cost its own feature, not the whole bundle (the file-level check in applyPatch is the
+// last resort). The check is skipped when the input itself does not parse as a script.
 function runSubPatches(content, subPatches) {
   const warnings = [];
   let next = content;
   let appliedCount = 0;
+  const checkSyntax = !compileError(content);
 
   for (const sub of subPatches) {
     const result = sub.inject(next);
-    if (result.ok) {
-      next = result.content;
-      appliedCount += 1;
-    } else {
+    if (!result.ok) {
       warnings.push(`${sub.name}: ${result.reason}`);
+      continue;
     }
+    const syntaxError = checkSyntax ? compileError(result.content) : null;
+    if (syntaxError) {
+      warnings.push(`${sub.name}: produces unparsable code, skipped (${syntaxError})`);
+      continue;
+    }
+    next = result.content;
+    appliedCount += 1;
   }
 
   if (appliedCount === 0) {
@@ -941,6 +952,7 @@ const PATCH_SITES = [
       'attach toggle OFF + per-session model badge + Ctrl+M model cycle + Ctrl+F context toggle + hide rate-limit warnings + uri-open panel listener',
     compute: computeWebviewPatch,
     revert: revertWebviewPatch,
+    syntaxCheck: true,
   },
   {
     relativePath: ['webview', 'index.css'],
@@ -953,6 +965,7 @@ const PATCH_SITES = [
     description: 'auto-allow gitignored Write/Edit prompts (bypass mode only) + capture permission mode + session-scoped model + session-scoped effort switch + uri /open in the Claude editor group',
     compute: computeExtensionPatch,
     revert: revertExtensionPatch,
+    syntaxCheck: true,
   },
 ];
 
@@ -990,6 +1003,17 @@ let reloadPromptShown = false;
 
 function hashContent(content) {
   return crypto.createHash('sha1').update(content).digest('hex');
+}
+
+// Parse (without running) a script bundle; returns the error message, or null when it
+// compiles. Both Claude Code bundles are classic scripts, so vm.Script is the right parser.
+function compileError(content) {
+  try {
+    new vm.Script(content);
+    return null;
+  } catch (e) {
+    return e.message;
+  }
 }
 
 async function promptReload(message) {
@@ -1063,17 +1087,39 @@ async function applyPatch(channel, { interactive = false } = {}) {
         continue;
       }
 
+      // A textually successful injection can still leave the bundle unparsable when the
+      // code around an anchor changed shape (2.1.261 turned a statement into an `if`
+      // operand). Never write such a file: an unparsable bundle takes the whole Claude
+      // Code UI down. Fall back to the clean upstream code instead, so the editor keeps
+      // working with the patches simply missing.
+      let output = result.content;
+      const syntaxError = site.syntaxCheck ? compileError(output) : null;
+      if (syntaxError && !compileError(baseContent)) {
+        channel.appendLine(`[no-auto-attach] Patched ${relLabel} does not parse (${syntaxError}); writing the unpatched bundle instead.`);
+        skipMessages.push(`${relLabel}: patched bundle does not parse (${syntaxError})`);
+        vscode.window.showErrorMessage(`Claude Code patch for ${relLabel} produced invalid code and was not applied: ${syntaxError}`);
+        if (baseContent === content) {
+          markStale(content);
+          continue;
+        }
+        output = baseContent;
+      }
+
       try {
-        fs.writeFileSync(filePath, result.content, 'utf8');
+        fs.writeFileSync(filePath, output, 'utf8');
       } catch (e) {
         channel.appendLine(`[no-auto-attach] Failed to write ${filePath}: ${e.message}`);
         vscode.window.showErrorMessage(`Failed to patch ${relLabel}: ${e.message}`);
         continue;
       }
 
-      channel.appendLine(`[no-auto-attach] Patched ${filePath} (${site.description}).`);
+      if (output === baseContent) {
+        channel.appendLine(`[no-auto-attach] Restored unpatched ${filePath}.`);
+      } else {
+        channel.appendLine(`[no-auto-attach] Patched ${filePath} (${site.description}).`);
+      }
       anyApplied = true;
-      markStale(result.content);
+      markStale(output);
     }
   }
 

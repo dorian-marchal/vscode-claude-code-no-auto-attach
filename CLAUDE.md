@@ -12,16 +12,17 @@ All logic is in [extension.js](extension.js) (no build step, no deps, no `node_m
 - Each sub-patch anchors on **minified CC internals via regex** and requires **exactly one match** — 0 or >1 → skipped with a logged reason, never destructive. When CC updates and the bundle shifts, anchors break and must be re-derived.
 - Injected code is wrapped in `/*__ccaaX*/ … /*__ccaaXEnd*/` sentinels for byte-exact revert; the attach-toggle and permission-capture patches revert by reversing their specific edit.
 - ⚠️ **Bump `MARKER` (`v40` → next) in [extension.js](extension.js) whenever patch logic changes.** `applyPatch` reverts any older marker before re-applying, so the bump is what makes the rollover seamless.
+- An anchor that still matches is not proof the injection is valid: 2.1.261 turned the `listSessions("panel_boot")` statement into an `if(…)` operand, and the old `try{…}` insertion produced an unparsable webview bundle (blank Claude panel). Injected code that sits next to an expression must itself be an expression (IIFE + comma), and `applyPatch` now parses every patched `.js` result with `vm.Script` before writing — an unparsable result restores the clean upstream file instead. When updating anchors, also run `node --check` on the patched output.
 - ⚠️ **Design every patch to minimize regression risk when CC's code changes.** Anchor on the smallest, most stable regex that still resolves to exactly one match, prefer behavior that degrades to a no-op (skip + log) over anything that could corrupt the bundle, and avoid coupling to incidental minified details that shift between releases. The goal is that a CC update either keeps working or cleanly skips the patch — never breaks the editor.
 
 ## Updating anchors after a CC release
 
 Inspect the live bundle to rewrite regexes:
-`~/.vscode/extensions/anthropic.claude-code-<version>/...` (current: `2.1.257-darwin-arm64`).
+`~/.vscode/extensions/anthropic.claude-code-<version>/...` (current: `2.1.261-darwin-arm64`).
 Since 2.1.251 the minifier also uses `$` as a bare variable name — anchor regexes must use `[\w$]+`, never `\w+`, and every `String.replace` whose replacement embeds captured variable names must use the function form (`replace(x, () => y)`) so `$`-sequences aren't interpreted.
 
 ## Build / release
 
 - `./install` — packages the vsix via `vsce` and `code --install-extension --force`. Reload window after.
 - Bump `version` in [package.json](package.json) before packaging (vsix filename is version-derived). `.vsix` files are gitignored.
-- No test runner despite the `// exported for tests` exports at the bottom of [extension.js](extension.js).
+- `node scripts/check.js` is the test: it dry-runs every sub-patch against each installed Claude Code version (reverting the on-disk marker first), parses the result, and checks the revert roundtrip. Run it after any anchor change; `--write-clean DIR` dumps the clean bundles for inspection. `/update` walks the whole release-update routine.
