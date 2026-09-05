@@ -3,3 +3,4 @@
 .git/**
 **/*.vsix
 .claude/**
+scripts/**
