@@ -3,7 +3,7 @@ const path = require('path');
 const crypto = require('crypto');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v40*/';
+const MARKER = '/*claude-code-no-auto-attach:v42*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -205,7 +205,9 @@ const MODEL_UI_SENTINEL_RE = /;\/\*__ccaaModelUi\*\/[\s\S]*?\/\*__ccaaModelUiEnd
 //   patch). Both are used by every model-switch action below so switching model also bumps
 //   effort to match the family.
 // - a Ctrl+M keydown handler (capture phase) that cycles through available models for
-//   the session rendered in this webview (and applies the family's effort).
+//   the session rendered in this webview (and applies the family's effort). Alias entries
+//   (older spellings, present since 2.1.261) are skipped; __ccaaPickable orders the real
+//   models first so the family lookups below and in the quick-send buttons prefer them.
 // - Ctrl+0 / Ctrl+1 / Ctrl+2 / Ctrl+3 keydown handlers (same listener) that switch the
 //   session to Fable / Opus / Sonnet / Haiku and submit the composer in one go — the
 //   keyboard equivalent of the quick-send buttons (Opus has no button).
@@ -314,8 +316,16 @@ function injectModelUi(content) {
     `__ccaaTip.style.left=__ccaaCx+"px";__ccaaTip.style.top=(__ccaaTop<4?__ccaaR.bottom+6:__ccaaTop)+"px";` +
     `__ccaaTip.style.transform="translateX(-50%)"}catch(__ccaaTe){}};` +
     `globalThis.__ccaaHideTip=()=>{try{var __ccaaTip=document.getElementById("ccaa-tip");if(__ccaaTip)__ccaaTip.style.display="none"}catch(__ccaaTe){}};` +
+    // Since 2.1.261 the model list also carries alias entries (older spellings of a model,
+    // flagged by "alias" in their name/description — the same test upstream's picker uses to
+    // list them last). Order the real models first so a family lookup lands on the current
+    // spelling, and leave the aliases out of the cycle unless they are all there is.
+    `globalThis.__ccaaIsAlias=(__ccaaM)=>/\\balias(?:es)?\\b/i.test(String(__ccaaM.displayName??"")+" "+String(__ccaaM.description??""));` +
+    `globalThis.__ccaaPickable=(__ccaaL)=>__ccaaL.filter((__ccaaM)=>!globalThis.__ccaaIsAlias(__ccaaM)).concat(__ccaaL.filter(globalThis.__ccaaIsAlias));` +
     `globalThis.__ccaaCycleModel=()=>{` +
-    `var __ccaaList=${sessionVar}.claudeConfig.value?.models??[];if(__ccaaList.length<2)return;` +
+    `var __ccaaAll=${sessionVar}.claudeConfig.value?.models??[];` +
+    `var __ccaaList=__ccaaAll.filter((__ccaaM)=>!globalThis.__ccaaIsAlias(__ccaaM));` +
+    `if(__ccaaList.length<2)__ccaaList=__ccaaAll;if(__ccaaList.length<2)return;` +
     `var __ccaaCurrent=${sessionVar}.modelSelection.value??"default";` +
     `var __ccaaIndex=__ccaaList.findIndex((__ccaaM)=>__ccaaM.value===__ccaaCurrent);` +
     `var __ccaaNext=__ccaaList[(__ccaaIndex+1)%__ccaaList.length];` +
@@ -338,7 +348,7 @@ function injectModelUi(content) {
     `globalThis.__ccaaSendWithModel=(__ccaaRe)=>{` +
     `var __ccaaBtn=document.querySelector('button[type="submit"][data-permission-mode]');` +
     `if(!__ccaaBtn||__ccaaBtn.disabled||${sessionVar}.busy.value)return;` +
-    `var __ccaaList=${sessionVar}.claudeConfig.value?.models??[];` +
+    `var __ccaaList=globalThis.__ccaaPickable(${sessionVar}.claudeConfig.value?.models??[]);` +
     `var __ccaaTarget=__ccaaList.find((__ccaaM)=>__ccaaRe.test(__ccaaM.value)||__ccaaRe.test(__ccaaM.displayName));` +
     `if(!__ccaaTarget)return;var __ccaaForm=__ccaaBtn.form;` +
     `Promise.resolve(__ccaaNeedsSwitch(${sessionVar},__ccaaTarget,__ccaaRe)?${sessionVar}.setModel(__ccaaTarget):null)` +
@@ -400,6 +410,7 @@ function injectSendModelButtons(content) {
   const button = (modelRe, background, color, shortcut) =>
     `(()=>{` +
     `var __ccaaModels=${sess}.claudeConfig.value?.models??[];` +
+    `__ccaaModels=globalThis.__ccaaPickable?.(__ccaaModels)??__ccaaModels;` +
     `var __ccaaTarget=__ccaaModels.find((__ccaaM)=>${modelRe}.test(__ccaaM.value)||${modelRe}.test(__ccaaM.displayName));` +
     `if(!__ccaaTarget)return null;` +
     `var __ccaaDisabled=${sess}.busy.value||!${canSubmit};` +
@@ -438,7 +449,9 @@ const URI_OPEN_WV_SENTINEL_RE = /\/\*__ccaaUriOpenWv\*\/[\s\S]*?\/\*__ccaaUriOpe
 // actually shows that session, which is how a broadcast (used when the panel already existed)
 // still lands in exactly one panel. `strict` marks that broadcast: the match then has 5s to
 // happen, otherwise this panel is not the target. A nonce set dedupes the delivery retries.
-// Injected at the app bootstrap, the one spot where the session store is in scope.
+// Injected at the app bootstrap, the one spot where the session store is in scope. The
+// bootstrap call is a plain statement up to 2.1.257 but an `if(…)` operand since 2.1.261, so
+// the listener is registered by an IIFE joined with the comma operator — valid in both spots.
 function injectUriOpenListener(content) {
   const anchorRe = /([\w$]+)\.listSessions\("panel_boot"\)\.then/g;
   const matches = [...content.matchAll(anchorRe)];
@@ -450,8 +463,13 @@ function injectUriOpenListener(content) {
   }
 
   const [whole, storeVar] = matches[0];
+  // Only prepend where an expression may start; anything else would need a different join.
+  const before = content[matches[0].index - 1];
+  if (!/[;(,{}]/.test(before ?? '')) {
+    return { ok: false, reason: `panel_boot bootstrap preceded by unexpected "${before}" (Claude Code internals may have changed)` };
+  }
   const insertion =
-    `/*__ccaaUriOpenWv*/try{if(!window.IS_SIDEBAR&&!globalThis.__ccaaUriOpenBound){globalThis.__ccaaUriOpenBound=!0;` +
+    `/*__ccaaUriOpenWv*/(()=>{try{if(!window.IS_SIDEBAR&&!globalThis.__ccaaUriOpenBound){globalThis.__ccaaUriOpenBound=!0;` +
     `var __ccaaUriSeen=new Set;` +
     `window.addEventListener("message",(__ccaaUriEv)=>{try{` +
     `var __ccaaUriMsg=__ccaaUriEv.data;` +
@@ -476,7 +494,7 @@ function injectUriOpenListener(content) {
     `if(!__ccaaUriBtn||__ccaaUriBtn.disabled||!__ccaaUriBtn.form)return;` +
     `clearInterval(__ccaaUriTimer);__ccaaUriBtn.form.requestSubmit()` +
     `}catch(__ccaaUriE1){clearInterval(__ccaaUriTimer)}},250)` +
-    `}catch(__ccaaUriE2){}})}}catch(__ccaaUriE3){}/*__ccaaUriOpenWvEnd*/`;
+    `}catch(__ccaaUriE2){}})}}catch(__ccaaUriE3){}})(),/*__ccaaUriOpenWvEnd*/`;
 
   return { ok: true, content: replaceMatch(content, matches[0], insertion + whole) };
 }
@@ -517,8 +535,9 @@ function revertSessionMountFocus(content) {
 const URI_OPEN_EXT_SENTINEL_RE = /\/\*__ccaaUriOpenExt\*\/[\s\S]*?\/\*__ccaaUriOpenExtEnd\*\//g;
 
 // vscode://anthropic.claude-code/open?prompt=…&session=… normally opens the session with
-// claude-vscode.primaryEditor.open, i.e. in the *active* editor group (ViewColumn.Active) —
-// so a URI hijacks whatever group you were working in. Route it through
+// claude-vscode.primaryEditor.open, i.e. in the *active* editor group (ViewColumn.Active
+// up to 2.1.257; since 2.1.261 it falls back to Active only when no group holds *solely*
+// Claude panels) — so a URI hijacks whatever group you were working in. Route it through
 // claude-vscode.editor.open instead — the command behind "open Claude in an editor" — with
 // the target column resolved here (stock's own "a group whose tabs are all Claude panels"
 // rule loses the group as soon as a file is dropped in it) and a lock afterwards, so a
@@ -644,10 +663,16 @@ const SESSION_MODEL_SENTINEL_RE = /\/\*__ccaaSessionModel\*\/[\s\S]*?\/\*__ccaaS
 
 // Upstream persists every model switch to ~/.claude/settings.json (it becomes the new
 // global default). Reroute it to the SDK's session-scoped set_model control request so
-// switching only affects the current session.
+// switching only affects the current session. Since 2.1.261 the response also carries the
+// CLI's `applied` settings (the webview adopts `applied.effort` after a switch, e.g. a
+// per-model effort from `modelSettings`), so the same is read back via getSettings — best
+// effort, the switch itself never depends on it.
 function injectSessionScopedModel(content) {
+  // Anchor on the signature plus the immediate writeUserSettingsAndPush(channel,{model:…})
+  // call; the body around it differs between releases (`return await …,{type:…}` up to
+  // 2.1.257, `let Q=await …;return{type:…,...Q!==void 0&&{applied:Q}}` since 2.1.261).
   const anchorRe =
-    /async setModel\(([\w$]+),([\w$]+)\)\{return await this\.writeUserSettingsAndPush\(\1,\{model:\2\.value==="default"\?null:\2\.value\}\),\{type:"set_model_response"\}\}/g;
+    /async setModel\(([\w$]+),([\w$]+)\)\{(?=(?:return await |let [\w$]+=await )this\.writeUserSettingsAndPush\(\1,\{model:\2\.value==="default"\?null:\2\.value\}\))/g;
   const matches = [...content.matchAll(anchorRe)];
   if (matches.length === 0) {
     return { ok: false, reason: 'setModel anchor not found (Claude Code internals may have changed)' };
@@ -660,13 +685,12 @@ function injectSessionScopedModel(content) {
   const insertion =
     `/*__ccaaSessionModel*/var __ccaaScoped=true;` +
     `try{__ccaaScoped=require("vscode").workspace.getConfiguration("claude-code-no-auto-attach").get("sessionScopedModelSwitch",true)}catch(__ccaaErr2){}` +
-    `if(__ccaaScoped)return await this.withChannel(${channelVar},async(__ccaaChannel)=>(await __ccaaChannel.query.setModel(${modelVar}.value==="default"?void 0:${modelVar}.value),{type:"set_model_response"}));` +
+    `if(__ccaaScoped)return await this.withChannel(${channelVar},async(__ccaaChannel)=>{` +
+    `await __ccaaChannel.query.setModel(${modelVar}.value==="default"?void 0:${modelVar}.value);` +
+    `var __ccaaApplied;try{__ccaaApplied=(await __ccaaChannel.query.getSettings())?.applied}catch(__ccaaErr3){}` +
+    `return{type:"set_model_response",...__ccaaApplied!==void 0&&{applied:__ccaaApplied}}});` +
     `/*__ccaaSessionModelEnd*/`;
-  const replacement = anchor.replace(
-    `async setModel(${channelVar},${modelVar}){`,
-    () => `async setModel(${channelVar},${modelVar}){${insertion}`
-  );
-  return { ok: true, content: content.replace(anchor, () => replacement) };
+  return { ok: true, content: replaceMatch(content, matches[0], anchor + insertion) };
 }
 
 const SESSION_EFFORT_SENTINEL_RE = /\/\*__ccaaSessionEffort\*\/[\s\S]*?\/\*__ccaaSessionEffortEnd\*\//g;
