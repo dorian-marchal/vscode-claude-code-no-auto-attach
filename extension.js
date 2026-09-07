@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const vm = require('vm');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v43*/';
+const MARKER = '/*claude-code-no-auto-attach:v44*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -727,33 +727,44 @@ const MD_PREVIEW_SENTINEL_RE = /\/\*__ccaaMdPreview\*\/[\s\S]*?\/\*__ccaaMdPrevi
 const MD_PREVIEW2_SENTINEL_RE = /\/\*__ccaaMdPreview2\*\/[\s\S]*?\/\*__ccaaMdPreview2End\*\//g;
 const MD_PREVIEW3_SENTINEL_RE = /\/\*__ccaaMdPreview3\*\/[\s\S]*?\/\*__ccaaMdPreview3End\*\//g;
 
-// A markdown *preview* is not a TextEditor, so focusing it makes activeTextEditor
-// undefined and Claude Code drops the current-file context (you'd have to switch back
-// to the raw .md). VS Code has TWO preview implementations and we handle both:
+// A markdown *preview* or *editor* tab is not a TextEditor, so focusing it makes
+// activeTextEditor undefined and Claude Code drops the current-file context (you'd have
+// to switch back to the raw .md). VS Code has two such implementations and we handle both:
 //   1. the classic "Open Preview" — a webview panel (viewType markdown.preview), whose
 //      tab input is a TabInputWebview that does NOT expose the source uri. We resolve
 //      it from the tab label's basename ("Preview README.md" / "[Preview] README.md"):
 //      prefer the last active markdown editor, then a uniquely-matching open markdown
 //      document, then a unique workspace file.
-//   2. the custom-editor preview (viewType vscode.markdown.editor), whose tab input is
-//      a TabInputCustom that DOES expose `.uri` — we read the source path directly.
+//   2. the custom editors — vscode.markdown.preview.editor and vscode.markdown.editor
+//      (the latter is what `workbench.editorAssociations` maps *.md to when you make the
+//      rich editor the default) — whose tab input is a TabInputCustom that DOES expose
+//      `.uri`, so we read the source path directly.
 // On a hit we set the same context object shape the upstream E4 helper produces for an
 // unselected file ({filePath,startLine,endLine}), which the webview renders as just the
-// basename. Three insertions, all reverted by stripping their sentinel blocks: a tracker
-// (records the last markdown editor), the resolver (runs in the `!r` branch before
-// upstream's clear/retain logic), and a tab-group listener (onDidChangeActiveTextEditor
-// only fires on text-editor changes, so preview->preview switches keep activeTextEditor
-// undefined and never re-run the resolver — the listener fires on active-tab changes
-// too, registered once, running the same resolver). A filePath dedup keeps the paths
-// from double-firing. Opt-in debug log (touch ~/.ccaa-debug) writes the active tab's
-// input type / viewType / uri / label to <tmpdir>/ccaa-md-debug.log on each event.
+// basename. Three insertions, all reverted by stripping their sentinel blocks:
+//   - a tracker in the active-editor handler, recording the last markdown text editor;
+//   - the resolver, inlined in that handler's `!editor` branch, ahead of upstream's
+//     clear/retain logic;
+//   - the tab listeners, registered eagerly as an extra disposable pushed next to the
+//     active-editor subscription.
+// The listeners have to be eager. onDidChangeActiveTextEditor only fires on text-editor
+// changes, so a window that only ever shows markdown custom editors never runs that
+// handler, and registering from inside it left the feature dead until you visited a text
+// editor once. They also re-resolve on a macrotask: a tab that has just opened is not yet
+// `activeTabGroup.activeTab` when the event fires, so the synchronous pass would read the
+// tab you came from. One pass also runs at activation, for a window that starts on a
+// markdown editor. The filePath dedup in the push makes every repeat a no-op.
+// Opt-in debug log (touch ~/.ccaa-debug) writes the active tab's input type / viewType /
+// uri / label to <tmpdir>/ccaa-md-debug.log on each event.
 function injectMarkdownPreviewContext(content) {
   // The clear branch resets one-or-more module state vars before firing (2.1.197 cleared
   // just the context var; 2.1.198+ also clears a URI-string tracker: `Nd=void 0,G_=void 0,`).
   // Capture the whole `X=void 0,` run so we can preserve it verbatim and stay tolerant of
   // future additions; the context var (whose `.filePath` the resolver sets) is the first one.
+  // The `<disposables>.push(` prefix is part of the anchor so the tab listeners can be
+  // registered there, at activation, instead of on the first active-editor event.
   const anchorRe =
-    /onDidChangeActiveTextEditor\(async\(([\w$]+)\)=>\{if\(!\1\)\{if\(([\w$]+)\(([\w$]+)\.window\.visibleTextEditors\.length\)==="retain"\)return;([\w$]+)\.bump\(\),((?:[\w$]+=void 0,)+)([\w$]+)\.fire\(void 0\);return\}/g;
+    /([\w$]+)\.push\(([\w$]+)\.window\.onDidChangeActiveTextEditor\(async\(([\w$]+)\)=>\{if\(!\3\)\{if\(([\w$]+)\(\2\.window\.visibleTextEditors\.length\)==="retain"\)return;([\w$]+)\.bump\(\),((?:[\w$]+=void 0,)+)([\w$]+)\.fire\(void 0\);return\}/g;
   const matches = [...content.matchAll(anchorRe)];
   if (matches.length === 0) {
     return { ok: false, reason: 'active-editor handler not found (Claude Code internals may have changed)' };
@@ -762,7 +773,7 @@ function injectMarkdownPreviewContext(content) {
     return { ok: false, reason: `ambiguous: ${matches.length} active-editor handlers found` };
   }
 
-  const [whole, editorVar, retainFn, vscodeNs, staleGuard, clearBody, emitter] = matches[0];
+  const [whole, disposables, vscodeNs, editorVar, retainFn, staleGuard, clearBody, emitter] = matches[0];
   const contextVar = clearBody.match(/^([\w$]+)=/)[1];
 
   const tracker =
@@ -772,26 +783,32 @@ function injectMarkdownPreviewContext(content) {
     `}catch(__ccaaMd0){}/*__ccaaMdPreviewEnd*/`;
 
   // Shared resolver body (no try/catch, no sentinels) — reused by the active-editor
-  // handler and the tab-group listener. The leading filePath dedup in __ccaaPush (and
-  // the findFiles path) makes re-runs against the same preview a no-op.
+  // handler and the tab listeners. The leading filePath dedup in __ccaaPush (and the
+  // findFiles path) makes re-runs against the same preview a no-op.
   const resolverBody = String.raw`var __ccaaBaseOf=function(__p){return String(__p).split(/[\\/]/).pop()};if(globalThis.__ccaaDbg===void 0){try{globalThis.__ccaaDbg=require("fs").existsSync(require("os").homedir()+"/.ccaa-debug")?require("os").tmpdir()+"/ccaa-md-debug.log":null}catch(__ccaaDbgE){globalThis.__ccaaDbg=null}}var __ccaaLog=function(__m){try{if(globalThis.__ccaaDbg)require("fs").appendFileSync(globalThis.__ccaaDbg,__m+"\n")}catch(__ccaaLogE){}};var __ccaaTab=${vscodeNs}.window.tabGroups&&${vscodeNs}.window.tabGroups.activeTabGroup&&${vscodeNs}.window.tabGroups.activeTabGroup.activeTab;var __ccaaIn=__ccaaTab&&__ccaaTab.input;var __ccaaVt=__ccaaIn&&__ccaaIn.viewType;__ccaaLog("evt in="+(__ccaaIn?__ccaaIn.constructor&&__ccaaIn.constructor.name:"none")+" vt="+(__ccaaVt||"-")+" uri="+((__ccaaIn&&__ccaaIn.uri&&__ccaaIn.uri.fsPath)||"-")+" label="+((__ccaaTab&&__ccaaTab.label)||"-"));var __ccaaPush=function(__fp){if(${contextVar}&&${contextVar}.filePath===__fp)return;${staleGuard}.bump();${contextVar}={filePath:__fp,startLine:1,endLine:1};${emitter}.fire(${contextVar});__ccaaLog("push "+__fp)};if(__ccaaIn&&__ccaaIn.uri&&__ccaaVt&&/\.(md|markdown|mdx)$/i.test(__ccaaIn.uri.fsPath||"")){__ccaaPush(__ccaaIn.uri.fsPath);return}if(__ccaaIn&&${vscodeNs}.TabInputWebview&&__ccaaIn instanceof ${vscodeNs}.TabInputWebview&&/markdown\.preview/.test(__ccaaVt||"")){var __ccaaLabel=__ccaaTab.label||"";var __ccaaLast=globalThis.__ccaaLastMd;if(__ccaaLast&&__ccaaLabel.endsWith(__ccaaBaseOf(__ccaaLast))){__ccaaPush(__ccaaLast);return}var __ccaaDocs=(${vscodeNs}.workspace.textDocuments||[]).filter(function(__d){return __d.languageId==="markdown"&&__ccaaLabel.endsWith(__ccaaBaseOf(__d.uri.fsPath))});if(__ccaaDocs.length===1){__ccaaPush(__ccaaDocs[0].uri.fsPath);return}var __ccaaBase=__ccaaLabel.replace(/^\[?[^\]\s]*\]?\s+/,"");if(/\.(md|markdown|mdx)$/i.test(__ccaaBase)&&!/[*?{}\[\]]/.test(__ccaaBase)){var __ccaaG=${staleGuard}.bump();${vscodeNs}.workspace.findFiles("**/"+__ccaaBase,"**/node_modules/**",2).then(function(__h){if(__h&&__h.length===1&&!${staleGuard}.isStale(__ccaaG)&&!(${contextVar}&&${contextVar}.filePath===__h[0].fsPath)){${contextVar}={filePath:__h[0].fsPath,startLine:1,endLine:1};${emitter}.fire(${contextVar});__ccaaLog("pushAsync "+__h[0].fsPath)}},function(){});return}}`;
 
   const resolver = `/*__ccaaMdPreview2*/try{` + resolverBody + `}catch(__ccaaMd1){}/*__ccaaMdPreview2End*/`;
 
-  // Registered once (global flag): active-tab listeners so preview<->preview switches
-  // re-resolve the source. onDidChangeTabs fires when a tab's isActive flips (switching
-  // tabs within a group); onDidChangeTabGroups fires on group-level changes (e.g. the
-  // active split group). Both run the same resolver; the filePath dedup keeps repeats
-  // from double-firing. Closes over the module vars.
+  // Pushed as an extra disposable in front of the active-editor subscription, so it is
+  // registered at activation and disposed with the extension. onDidChangeTabs fires when a
+  // tab opens or its isActive flips; onDidChangeTabGroups covers group-level changes such
+  // as the active split. Always returns a disposable (a no-op one on failure) so the
+  // subscriptions array stays valid whatever happens here.
   const tabListener =
-    `/*__ccaaMdPreview3*/try{if(!globalThis.__ccaaTabSub){globalThis.__ccaaTabSub=1;` +
-    `var __ccaaOnTab=function(){try{` + resolverBody + `}catch(__ccaaMd2){}};` +
-    `${vscodeNs}.window.tabGroups.onDidChangeTabs(__ccaaOnTab);` +
-    `${vscodeNs}.window.tabGroups.onDidChangeTabGroups(__ccaaOnTab);` +
-    `}}catch(__ccaaMd3){}/*__ccaaMdPreview3End*/`;
+    `/*__ccaaMdPreview3*/(function(){` +
+    `var __ccaaNoop={dispose:function(){}};try{` +
+    `if(globalThis.__ccaaTabSub)return __ccaaNoop;globalThis.__ccaaTabSub=1;` +
+    `var __ccaaResolve=function(){try{` + resolverBody + `}catch(__ccaaMd2){}};` +
+    `var __ccaaOnTab=function(){__ccaaResolve();setTimeout(__ccaaResolve,0)};` +
+    `var __ccaaSubs=[${vscodeNs}.window.tabGroups.onDidChangeTabs(__ccaaOnTab),` +
+    `${vscodeNs}.window.tabGroups.onDidChangeTabGroups(__ccaaOnTab)];` +
+    `setTimeout(__ccaaResolve,0);` +
+    `return{dispose:function(){globalThis.__ccaaTabSub=0;__ccaaSubs.forEach(function(__s){try{__s.dispose()}catch(__ccaaMd4){}})}}` +
+    `}catch(__ccaaMd3){return __ccaaNoop}})(),/*__ccaaMdPreview3End*/`;
 
   const replacement =
-    `onDidChangeActiveTextEditor(async(${editorVar})=>{` + tracker + tabListener +
+    `${disposables}.push(` + tabListener +
+    `${vscodeNs}.window.onDidChangeActiveTextEditor(async(${editorVar})=>{` + tracker +
     `if(!${editorVar}){` + resolver +
     `if(${retainFn}(${vscodeNs}.window.visibleTextEditors.length)==="retain")return;` +
     `${staleGuard}.bump(),${clearBody}${emitter}.fire(void 0);return}`;
