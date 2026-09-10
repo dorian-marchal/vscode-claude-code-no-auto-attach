@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const vm = require('vm');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v45*/';
+const MARKER = '/*claude-code-no-auto-attach:v47*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -550,6 +550,113 @@ function revertAskQuestionFocus(content) {
   return content.replace(ASK_FOCUS_REVERT_RE, '');
 }
 
+const ASK_NOTES_JSX_SENTINEL_RE = /,\/\*__ccaaAskNotes\*\/[\s\S]*?\/\*__ccaaAskNotesEnd\*\//g;
+const ASK_NOTES_OUT_REVERT_RE =
+  /\/\*__ccaaAskNotesOut\*\/\(\(__ccaaP\)=>\{[\s\S]*?\}\)\(([\s\S]*?)\)\/\*__ccaaAskNotesOutEnd\*\//g;
+
+// AskUserQuestion only takes free text through the "Other" option, i.e. instead of a choice —
+// picking an option and adding a caveat is impossible in the webview. The CLI side already
+// supports it: the tool input carries `annotations[question].notes`, which the CLI renders into
+// the tool result as `notes: …` next to the answer (and, when notes are present, tells the model
+// to read the answer carefully rather than treating it as a plain pick). Its "(notes only)"
+// answer sentinel covers notes without a selection. So this only adds the missing input.
+//
+// Two edits, both required (a notes box that never reaches the model is worse than none):
+//   1. a free-text box at the end of every question's option list, hidden while "Other" is
+//      selected — "Other" already shows the same box inline, and both write the same state,
+//      so no new hook is added and nothing is lost when switching between the two;
+//   2. the effect that reports the answers back also reports the notes, and fills in the
+//      "(notes only)" answer for a question that got notes but no pick (the submit button is
+//      gated on every question having a non-empty answer).
+// Enter in the box submits (it bubbles to the dialog, which owns Enter), Shift+Enter breaks a
+// line, and every other key is stopped so the option list's arrow/digit handling stays out.
+function injectAskQuestionNotes(content) {
+  const jsxRe =
+    /([\w$]+)\("Other"\)&&([\w$]+)\("div",\{onFocus:\(\)=>([\w$]+)\(!0\),onBlur:\(\)=>\3\(!1\),onClick:\(([\w$]+)\)=>\4\.stopPropagation\(\),children:\2\(([\w$]+),\{ref:[\w$]+,className:([\w$]+)\.otherInput,placeholder:"[^"]*",value:([\w$]+)\[([\w$]+)\.question\]\|\|"",onChange:\([\w$]+\)=>([\w$]+)\([\w$]+\.question,[\w$]+\),onKeyDown:[\s\S]{0,400}?\}\}\}\)\}\)\]\}\)\]\}\)(\]\}\))/g;
+  const jsxMatches = [...content.matchAll(jsxRe)];
+  if (jsxMatches.length === 0) {
+    return { ok: false, reason: 'question "Other" input not found (Claude Code internals may have changed)' };
+  }
+  if (jsxMatches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${jsxMatches.length} question "Other" inputs found` };
+  }
+
+  const outRe =
+    /([\w$]+)\(\{questions:([\w$]+)\.questions,answers:([\w$]+)\}\)\},\[([\w$]+),([\w$]+),\2\.questions,\1\]\)/g;
+  const outMatches = [...content.matchAll(outRe)];
+  if (outMatches.length === 0) {
+    return { ok: false, reason: 'question answers effect not found (Claude Code internals may have changed)' };
+  }
+  if (outMatches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${outMatches.length} question answers effects found` };
+  }
+
+  const [jsxWhole, isChecked, jsx, setTextFocused, , input, styles, textMap, question, setText, tail] = jsxMatches[0];
+  const notesBox =
+    `,/*__ccaaAskNotes*/!${isChecked}("Other")&&${jsx}("div",{` +
+    `onFocus:()=>${setTextFocused}(!0),onBlur:()=>${setTextFocused}(!1),` +
+    `onClick:(__ccaaE)=>__ccaaE.stopPropagation(),` +
+    `children:${jsx}(${input},{className:${styles}.otherInput,placeholder:"Add notes (optional)…",` +
+    `value:${textMap}[${question}.question]||"",onChange:(__ccaaV)=>${setText}(${question}.question,__ccaaV),` +
+    `onKeyDown:(__ccaaE)=>{` +
+    `if(__ccaaE.key==="Enter"&&!__ccaaE.shiftKey&&!__ccaaE.metaKey&&!__ccaaE.ctrlKey){` +
+    `if(__ccaaE.nativeEvent.isComposing)return;__ccaaE.preventDefault();return}` +
+    `if(!__ccaaE.metaKey&&!__ccaaE.ctrlKey)__ccaaE.stopPropagation()}})})/*__ccaaAskNotesEnd*/`;
+  const withBox = replaceMatch(
+    content,
+    jsxMatches[0],
+    jsxWhole.slice(0, jsxWhole.length - tail.length) + notesBox + tail
+  );
+
+  const [, report, props, answers, selections, texts] = outMatches[0];
+  const original = `{questions:${props}.questions,answers:${answers}}`;
+  const reportWithNotes =
+    `${report}(/*__ccaaAskNotesOut*/((__ccaaP)=>{try{` +
+    `for(var __ccaaQ of __ccaaP.questions||[]){` +
+    `var __ccaaSel=${selections}[__ccaaQ.question];` +
+    `if(__ccaaSel&&__ccaaSel.has("Other"))continue;` +
+    `var __ccaaN=(${texts}[__ccaaQ.question]||"").trim();if(!__ccaaN)continue;` +
+    `(__ccaaP.annotations||(__ccaaP.annotations={}))[__ccaaQ.question]={notes:__ccaaN};` +
+    `if(!__ccaaP.answers[__ccaaQ.question])__ccaaP.answers[__ccaaQ.question]="(notes only)"}` +
+    `}catch(__ccaaE){}return __ccaaP})(${original})/*__ccaaAskNotesOutEnd*/)},` +
+    `[${selections},${texts},${props}.questions,${report}])`;
+
+  return { ok: true, content: replaceMatch(withBox, outMatches[0], reportWithNotes) };
+}
+
+function revertAskQuestionNotes(content) {
+  return content
+    .replace(ASK_NOTES_JSX_SENTINEL_RE, '')
+    .replace(ASK_NOTES_OUT_REVERT_RE, (_, original) => original);
+}
+
+const NO_ADVANCE_REVERT_RE = /\/\*__ccaaNoAdvance:([^*]*)\*\//g;
+
+// Picking an option in a multi-question dialog jumps to the next question 300ms later, which
+// makes the notes box above unreachable right when you want it: the question you just answered
+// is gone before you can annotate it. Drop the clause — the nav tabs (which mark answered
+// questions) and ArrowLeft/ArrowRight still move between questions, and submit is unaffected:
+// it stays gated on every question having an answer. The clause is parked in a sentinel
+// comment for a byte-exact revert.
+function injectNoQuestionAutoAdvance(content) {
+  const anchorRe =
+    /else if\(([\w$]+)===null&&([\w$]+)\.questions&&([\w$]+)<\2\.questions\.length-1\)([\w$]+)\([\w$]+\),setTimeout\(\(\)=>\{\4\(null\),[\w$]+\(\3\+1\)\},300\);/g;
+  const matches = [...content.matchAll(anchorRe)];
+  if (matches.length === 0) {
+    return { ok: false, reason: 'question auto-advance not found (Claude Code internals may have changed)' };
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${matches.length} question auto-advance sites found` };
+  }
+
+  const [whole] = matches[0];
+  return { ok: true, content: replaceMatch(content, matches[0], `/*__ccaaNoAdvance:${whole}*/`) };
+}
+
+function revertQuestionAutoAdvance(content) {
+  return content.replace(NO_ADVANCE_REVERT_RE, (_, original) => original);
+}
+
 // --- extension.js sub-patches ---
 
 const URI_OPEN_EXT_SENTINEL_RE = /\/\*__ccaaUriOpenExt\*\/[\s\S]*?\/\*__ccaaUriOpenExtEnd\*\//g;
@@ -894,7 +1001,9 @@ function computeWebviewPatch(content, { detachContextByDefault = true } = {}) {
     { name: 'hide-rate-limit-warning', inject: injectHideRateLimitWarning },
     { name: 'uri-open-listener', inject: injectUriOpenListener },
     { name: 'session-mount-focus', inject: injectSessionMountFocus },
-    { name: 'question-keeps-focus', inject: injectAskQuestionFocus }
+    { name: 'question-keeps-focus', inject: injectAskQuestionFocus },
+    { name: 'question-notes-input', inject: injectAskQuestionNotes },
+    { name: 'question-no-auto-advance', inject: injectNoQuestionAutoAdvance }
   );
   return runSubPatches(content, subPatches);
 }
@@ -910,6 +1019,8 @@ function revertWebviewPatch(content) {
   next = revertHideRateLimitWarning(next);
   next = revertSessionMountFocus(next);
   next = revertAskQuestionFocus(next);
+  next = revertAskQuestionNotes(next);
+  next = revertQuestionAutoAdvance(next);
   next = revertAttachToggleOff(next);
   next = next.replace(MODEL_UI_SENTINEL_RE, '');
   next = next.replace(SEND_MODEL_BUTTONS_SENTINEL_RE, '');
