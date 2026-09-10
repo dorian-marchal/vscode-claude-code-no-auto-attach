@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const vm = require('vm');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v44*/';
+const MARKER = '/*claude-code-no-auto-attach:v45*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -523,6 +523,33 @@ function revertSessionMountFocus(content) {
   return MOUNT_FOCUS_REVERT_RE.test(content) ? content.replace(MOUNT_FOCUS_REVERT_RE, (_, original) => original) : content;
 }
 
+const ASK_FOCUS_REVERT_RE = /\/\*__ccaaAskFocus\*\/document\.hasFocus\(\)&&/g;
+
+// The AskUserQuestion widget focuses its first option as soon as it renders, with a bare
+// `.focus()` — no visibility or focus gate, unlike every other permission request (those go
+// through `safeFocus` and, for the option list, `document.hasFocus()`). Inside a webview
+// iframe that call pulls window focus into the panel, so a question asked while you type in
+// an editor or terminal steals the keystrokes. Gate it on `document.hasFocus()`: the panel
+// only grabs focus when focus is already inside it, and moving between questions (the effect
+// re-runs on the question index) still focuses the first option.
+function injectAskQuestionFocus(content) {
+  const anchorRe = /[\w$]+\.querySelector\('\[role="radio"\], \[role="checkbox"\]'\)\?\.focus\(\)/g;
+  const matches = [...content.matchAll(anchorRe)];
+  if (matches.length === 0) {
+    return { ok: false, reason: 'question option auto-focus not found (Claude Code internals may have changed)' };
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${matches.length} question option auto-focus sites found` };
+  }
+
+  const [whole] = matches[0];
+  return { ok: true, content: replaceMatch(content, matches[0], `/*__ccaaAskFocus*/document.hasFocus()&&${whole}`) };
+}
+
+function revertAskQuestionFocus(content) {
+  return content.replace(ASK_FOCUS_REVERT_RE, '');
+}
+
 // --- extension.js sub-patches ---
 
 const URI_OPEN_EXT_SENTINEL_RE = /\/\*__ccaaUriOpenExt\*\/[\s\S]*?\/\*__ccaaUriOpenExtEnd\*\//g;
@@ -866,7 +893,8 @@ function computeWebviewPatch(content, { detachContextByDefault = true } = {}) {
     { name: 'send-model-buttons', inject: injectSendModelButtons },
     { name: 'hide-rate-limit-warning', inject: injectHideRateLimitWarning },
     { name: 'uri-open-listener', inject: injectUriOpenListener },
-    { name: 'session-mount-focus', inject: injectSessionMountFocus }
+    { name: 'session-mount-focus', inject: injectSessionMountFocus },
+    { name: 'question-keeps-focus', inject: injectAskQuestionFocus }
   );
   return runSubPatches(content, subPatches);
 }
@@ -881,6 +909,7 @@ function revertWebviewPatch(content) {
   next = revertSlashKeepsSelection(next);
   next = revertHideRateLimitWarning(next);
   next = revertSessionMountFocus(next);
+  next = revertAskQuestionFocus(next);
   next = revertAttachToggleOff(next);
   next = next.replace(MODEL_UI_SENTINEL_RE, '');
   next = next.replace(SEND_MODEL_BUTTONS_SENTINEL_RE, '');
@@ -958,7 +987,7 @@ const PATCH_SITES = [
   {
     relativePath: ['webview', 'index.js'],
     description:
-      'attach toggle OFF + per-session model badge + Ctrl+M model cycle + Ctrl+F context toggle + hide rate-limit warnings + uri-open panel listener',
+      'attach toggle OFF + per-session model badge + Ctrl+M model cycle + Ctrl+F context toggle + hide rate-limit warnings + uri-open panel listener + questions keep your focus',
     compute: computeWebviewPatch,
     revert: revertWebviewPatch,
     syntaxCheck: true,
