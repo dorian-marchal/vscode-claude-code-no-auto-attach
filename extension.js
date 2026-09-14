@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const vm = require('vm');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v50*/';
+const MARKER = '/*claude-code-no-auto-attach:v52*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -69,6 +69,40 @@ function revertContextSendFlag(content) {
   return SLASH_SEL_REVERT_RE.test(content)
     ? content.replace(SLASH_SEL_REVERT_RE, (_, expr) => expr)
     : content;
+}
+
+const CHIP_CLICK_SENTINEL_RE = /\/\*__ccaaChipClick\*\/[\s\S]*?\/\*__ccaaChipClickEnd\*\//g;
+
+// Give the composer's file chip its click back. Up to 2.1.263 the chip was a button that
+// toggled the attachment; 2.1.269 turned it into a static span with a dismiss X next to it,
+// leaving Ctrl+F as the only way to detach. Clicking the chip now flips the same global the
+// send-time flag reads, so click and Ctrl+F do the same thing (the X keeps upstream's
+// dismiss). The pointer cursor rides with the injection rather than with the CSS file, so it
+// can never promise a click this patch did not add, and mousedown is cancelled to keep the
+// caret in the composer — clicking a non-focusable element otherwise blurs the textarea.
+function injectChipClickToggle(content) {
+  // Anchored on the static chip only: the `footerButtonStatic` class is what tells the
+  // 2.1.269+ chip from the button it replaced, which carries an `onClick` of its own an
+  // injected one would silently override. Older bundles match nothing and are skipped.
+  const anchorRe =
+    /className:`\$\{([\w$]+)\.footerButton\} \$\{\1\.footerButtonStatic\}`,(title:`Showing Claude your current file selection \(\$\{[\w$]+\}\)`)/g;
+  const matches = [...content.matchAll(anchorRe)];
+  if (matches.length === 0) {
+    return { ok: false, reason: 'static file chip not found (Claude Code internals may have changed)' };
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${matches.length} file chips found` };
+  }
+
+  const injection =
+    `/*__ccaaChipClick*/` +
+    `onClick:()=>globalThis.__ccaaToggleContext?.(),` +
+    `onMouseDown:(__ccaaE)=>__ccaaE.preventDefault(),` +
+    `style:{cursor:"pointer"},` +
+    `/*__ccaaChipClickEnd*/`;
+  const [whole, , titleProp] = matches[0];
+  const replacement = whole.replace(titleProp, () => injection + titleProp);
+  return { ok: true, content: replaceMatch(content, matches[0], replacement) };
 }
 
 // Revert helpers for shapes this extension no longer produces, kept so the marker rollover
@@ -976,6 +1010,7 @@ function computeWebviewPatch(content, { detachContextByDefault = true } = {}) {
   subPatches.push(
     { name: 'model-badge-and-shortcut', inject: (c) => injectModelUi(c, { contextOnByDefault }) },
     { name: 'context-send-flag', inject: (c) => injectContextSendFlag(c, { contextOnByDefault }) },
+    { name: 'chip-click-toggle', inject: injectChipClickToggle },
     { name: 'send-model-buttons', inject: injectSendModelButtons },
     { name: 'hide-rate-limit-warning', inject: injectHideRateLimitWarning },
     { name: 'uri-open-listener', inject: injectUriOpenListener },
@@ -998,6 +1033,7 @@ function revertWebviewPatch(content) {
   next = revertAskQuestionFocus(next);
   next = revertAskQuestionNotes(next);
   next = revertQuestionAutoAdvance(next);
+  next = next.replace(CHIP_CLICK_SENTINEL_RE, '');
   next = next.replace(MODEL_UI_SENTINEL_RE, '');
   next = next.replace(SEND_MODEL_BUTTONS_SENTINEL_RE, '');
   next = next.replace(URI_OPEN_WV_SENTINEL_RE, '');
