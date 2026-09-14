@@ -4,13 +4,9 @@ const crypto = require('crypto');
 const vm = require('vm');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v47*/';
+const MARKER = '/*claude-code-no-auto-attach:v50*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
-
-function escapeRegex(s) {
-  return s.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
-}
 
 // Replace a single regex match at its exact index (avoids first-occurrence ambiguity
 // and `$`-in-replacement pitfalls of String.prototype.replace).
@@ -25,103 +21,33 @@ function stripMarker(content) {
 
 // --- webview/index.js sub-patches ---
 
-// Locate the useState init for the include-selection toggle. The [state,setter] pair name
-// is reused by other components earlier in the bundle, so anchor on the declaration closest
-// *before* the toggle prop (it lives in the same component) rather than the first match in
-// the file — otherwise revert flips the wrong component's state.
-function findIncludeSelectionUseState(content) {
-  const ownerRe = /includeSelection:([A-Za-z_$][\w$]*),onToggleIncludeSelection:\(\)=>([A-Za-z_$][\w$]*)\(/g;
-  const owners = [...content.matchAll(ownerRe)];
-  if (owners.length === 0) {
-    return { ok: false, reason: 'owner site not found (Claude Code internals may have changed)' };
-  }
-  if (owners.length > 1) {
-    return { ok: false, reason: `ambiguous: ${owners.length} owner sites found` };
-  }
+// Matches both shapes this patch has produced: the v49 global read, and v48's plain `!0`
+// (which forced the context on for every message). The pre-v48 shape, where the flag kept
+// the composer's own toggle variable, is reverted by revertLegacySelectionPatches.
+const SLASH_SEL_REVERT_RE =
+  /(?:!0|\(globalThis\.__ccaaContextOn\?\?!\d\))\/\*__ccaaSlashSel:((?:[\w$]+&&)?![\w$]+)\*\//;
 
-  const [, stateVar, setterVar] = owners[0];
-  const toggleIndex = owners[0].index;
-  // The hook may be written as `X.useState(!0)` (older bundles) or, once the minifier
-  // aliases React's hooks to bare locals, `ne(!0)`. Match either, still pinned to the exact
-  // [state,setter] pair and a boolean init so it can only resolve to the toggle's useState.
-  const declRe = new RegExp(
-    `\\[${escapeRegex(stateVar)},${escapeRegex(setterVar)}\\]=[A-Za-z_$][\\w$]*(?:\\.useState)?\\((!0|!1)\\)`,
-    'g'
-  );
-  let best = null;
-  for (const m of content.matchAll(declRe)) {
-    if (m.index < toggleIndex) best = m;
-    else break;
-  }
-  if (!best) {
-    return { ok: false, reason: `useState init for [${stateVar},${setterVar}] not found` };
-  }
-  return { ok: true, match: best, init: best[1] };
-}
-
-function injectAttachToggleOff(content) {
-  const found = findIncludeSelectionUseState(content);
-  if (!found.ok) return found;
-  if (found.init === '!1') return { ok: true, content }; // already detached
-  return { ok: true, content: replaceMatch(content, found.match, found.match[0].replace(/\(!0\)$/, '(!1)')) };
-}
-
-function revertAttachToggleOff(content) {
-  const found = findIncludeSelectionUseState(content);
-  if (!found.ok || found.init === '!0') return content; // nothing to revert
-  return replaceMatch(content, found.match, found.match[0].replace(/\(!1\)$/, '(!0)'));
-}
-
-const CONTEXT_TOGGLE_REVERT_RE =
-  /onToggleIncludeSelection:\/\*__ccaaCtxToggle\*\/[\s\S]*?globalThis\.__ccaaToggleContext=\(\)=>([\w$]+)\([\s\S]*?\/\*__ccaaCtxToggleEnd\*\//;
-
-// Expose the composer's include-selection toggle as a global and bind a capture-phase
-// Ctrl+F keydown that flips it — so the current file/selection can be attached/detached
-// from the keyboard while a Claude session is focused. The click toggle still works
-// (the original setter is preserved and reconstructed byte-exact on revert).
-function injectContextToggleShortcut(content) {
-  const anchorRe =
-    /includeSelection:([A-Za-z_$][\w$]*),onToggleIncludeSelection:\(\)=>([A-Za-z_$][\w$]*)\(\(([A-Za-z_$][\w$]*)\)=>!\3\)/g;
-  const matches = [...content.matchAll(anchorRe)];
-  if (matches.length === 0) {
-    return { ok: false, reason: 'include-selection toggle site not found (Claude Code internals may have changed)' };
-  }
-  if (matches.length > 1) {
-    return { ok: false, reason: `ambiguous: ${matches.length} include-selection toggle sites found` };
-  }
-
-  const [whole, stateVar, setterVar] = matches[0];
-  const replacement =
-    `includeSelection:${stateVar},onToggleIncludeSelection:/*__ccaaCtxToggle*/(()=>{` +
-    `globalThis.__ccaaToggleContext=()=>${setterVar}((__ccaaT)=>!__ccaaT);` +
-    `if(!globalThis.__ccaaContextKeyBound){globalThis.__ccaaContextKeyBound=!0;` +
-    `window.addEventListener("keydown",(__ccaaE)=>{` +
-    `if(__ccaaE.ctrlKey&&!__ccaaE.metaKey&&!__ccaaE.altKey&&!__ccaaE.shiftKey&&(__ccaaE.key==="f"||__ccaaE.key==="F")){` +
-    `__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaToggleContext?.()}},!0)}` +
-    `return globalThis.__ccaaToggleContext})()/*__ccaaCtxToggleEnd*/`;
-
-  return { ok: true, content: content.replace(whole, () => replacement) };
-}
-
-function revertContextToggle(content) {
-  return CONTEXT_TOGGLE_REVERT_RE.test(content)
-    ? content.replace(CONTEXT_TOGGLE_REVERT_RE, (_, setterVar) => `onToggleIncludeSelection:()=>${setterVar}(($)=>!$)`)
-    : content;
-}
-
-const SLASH_SEL_REVERT_RE = /\/\*__ccaaSlashSel:(&&![\w$]+)\*\//;
-
-// On submit, upstream computes the include-selection flag as `gt=v&&!De` where v is the
-// toggle state and De is "the message starts with /". So the current file/selection is
-// silently dropped for *every* slash command — including skills — even when the toggle is
-// on. Drop the `&&!De` guard so the toggle alone decides; the original suffix is parked in
-// a sentinel comment for a byte-exact revert. (Explicitly attached files are passed
-// separately and were never affected; this is only the IDE current-file/selection path.)
-function injectSlashKeepsSelection(content) {
-  // Anchor on the stable shape — `let flag=toggle&&!startsWithSlash;helper(x.selection.value,flag,`
-  // — rather than the minified helper name (it churns between releases, e.g. YXe→rZe). The
+// The composer computes one flag that decides whether the current file/selection rides
+// along with the message — `session.send(text,files,includeSelection,…)` only attaches
+// `selection.value` when it is set. Upstream derives it as `!startsWithSlash` (before
+// 2.1.270, `includeSelection && !startsWithSlash`), which means two things at once: the
+// context is attached to everything by default, and it is silently dropped for *any*
+// message starting with `/` — so a skill or slash command never saw your open file.
+//
+// Both are replaced by a single global the Ctrl+F toggle owns, defaulting to detached (or
+// to attached, when `detachContextByDefault` is off). The slash check is gone either way:
+// the toggle alone decides. The original expression is parked in a sentinel comment for a
+// byte-exact revert.
+//
+// This is deliberately the *send-time* flag and not the selection itself: holding the
+// selection back at the session (`applySelectionUpdate`) would also remove the composer's
+// file chip, which is the only way to see which file is current and is what the X button
+// acts on. Attached or not, the chip stays — the CSS patch dims it while context is off.
+function injectContextSendFlag(content, { contextOnByDefault = false } = {}) {
+  // Anchor on the stable shape — `let flag=!startsWithSlash;helper(x.selection.value,flag,`
+  // — rather than the minified helper name (it churns between releases, e.g. YXe→jX0). The
   // `.selection.value` read and the backreference to the just-declared flag keep it unique.
-  const anchorRe = /let ([\w$]+)=([\w$]+)(&&![\w$]+);([\w$]+\([\w$]+\.selection\.value,\1,)/g;
+  const anchorRe = /let ([\w$]+)=((?:[\w$]+&&)?![\w$]+);([\w$]+\([\w$]+\.selection\.value,\1,)/g;
   const matches = [...content.matchAll(anchorRe)];
   if (matches.length === 0) {
     return { ok: false, reason: 'selection-gate site not found (Claude Code internals may have changed)' };
@@ -130,15 +56,49 @@ function injectSlashKeepsSelection(content) {
     return { ok: false, reason: `ambiguous: ${matches.length} selection-gate sites found` };
   }
 
-  const [whole, stateVar, toggleVar, suffix, tail] = matches[0];
-  const replacement = `let ${stateVar}=${toggleVar}/*__ccaaSlashSel:${suffix}*/;${tail}`;
+  const [whole, stateVar, expr, tail] = matches[0];
+  // `??` and not `!!`, so the default still holds if the Ctrl+F patch (which seeds the
+  // global) was skipped — the feature degrades to a fixed default, never to "never attach".
+  const fallback = contextOnByDefault ? '!0' : '!1';
+  const replacement =
+    `let ${stateVar}=(globalThis.__ccaaContextOn??${fallback})/*__ccaaSlashSel:${expr}*/;${tail}`;
   return { ok: true, content: content.replace(whole, () => replacement) };
 }
 
-function revertSlashKeepsSelection(content) {
+function revertContextSendFlag(content) {
   return SLASH_SEL_REVERT_RE.test(content)
-    ? content.replace(SLASH_SEL_REVERT_RE, (_, suffix) => suffix)
+    ? content.replace(SLASH_SEL_REVERT_RE, (_, expr) => expr)
     : content;
+}
+
+// Revert helpers for shapes this extension no longer produces, kept so the marker rollover
+// stays byte-exact on an already-patched install: v47-and-earlier's `includeSelection`
+// useState flipped to !1 and its toggle prop rewritten into an IIFE, and v48's short-lived
+// attempt at defaulting the context off inside the session's applySelectionUpdate — which
+// also hid the composer's file chip, and which v49 replaced with the send-time flag.
+const LEGACY_CTX_TOGGLE_RE =
+  /onToggleIncludeSelection:\/\*__ccaaCtxToggle\*\/[\s\S]*?globalThis\.__ccaaToggleContext=\(\)=>([\w$]+)\([\s\S]*?\/\*__ccaaCtxToggleEnd\*\//;
+const LEGACY_SLASH_SEL_RE = /([\w$]+)\/\*__ccaaSlashSel:(&&![\w$]+)\*\//;
+const LEGACY_DETACH_RE = /\/\*__ccaaDetach\*\/[\s\S]*?\/\*__ccaaDetachEnd\*\//g;
+
+function revertLegacySelectionPatches(content) {
+  let next = content.replace(LEGACY_DETACH_RE, '');
+  next = next.replace(
+    LEGACY_CTX_TOGGLE_RE,
+    (_, setterVar) => `onToggleIncludeSelection:()=>${setterVar}(($)=>!$)`
+  );
+  next = next.replace(LEGACY_SLASH_SEL_RE, (_, toggleVar, suffix) => toggleVar + suffix);
+  // The detach default was a one-character edit with no sentinel, so it is found the way it
+  // was made: the useState closest before the (now reverted) toggle prop, in that component.
+  const owner = /includeSelection:([A-Za-z_$][\w$]*),onToggleIncludeSelection:\(\)=>([A-Za-z_$][\w$]*)\(/.exec(next);
+  if (!owner) return next;
+  const declRe = new RegExp(`\\[${owner[1]},${owner[2]}\\]=[A-Za-z_$][\\w$]*(?:\\.useState)?\\(!1\\)`, 'g');
+  let best = null;
+  for (const m of next.matchAll(declRe)) {
+    if (m.index < owner.index) best = m;
+    else break;
+  }
+  return best ? replaceMatch(next, best, best[0].replace(/\(!1\)$/, '(!0)')) : next;
 }
 
 const RATE_LIMIT_REVERT_RE =
@@ -212,7 +172,7 @@ const MODEL_UI_SENTINEL_RE = /;\/\*__ccaaModelUi\*\/[\s\S]*?\/\*__ccaaModelUiEnd
 // - Ctrl+0 / Ctrl+1 / Ctrl+2 / Ctrl+3 keydown handlers (same listener) that switch the
 //   session to Fable / Opus / Sonnet / Haiku and submit the composer in one go — the
 //   keyboard equivalent of the quick-send buttons (Opus has no button).
-function injectModelUi(content) {
+function injectModelUi(content, { contextOnByDefault = false } = {}) {
   // Match both the pre-2.1.177 inline label computation and the 2.1.177+ form, where it was
   // extracted into a helper (…,ze=GCe(q,t.lastServedModel.value,Te);n.commandRegistry.registerAction…).
   // We anchor on the stable bits — the modelSelection/claudeConfig reads and the
@@ -347,6 +307,22 @@ function injectModelUi(content) {
     `Promise.resolve(__ccaaNeedsSwitch(${sessionVar},__ccaaTarget,__ccaaRe)?${sessionVar}.setModel(__ccaaTarget):null)` +
     `.then(()=>globalThis.__ccaaApplyEffort(${sessionVar},__ccaaTarget))` +
     `.then(()=>{if(__ccaaForm)__ccaaForm.requestSubmit()})};` +
+    // Attach/detach the current file/selection: flip the global the composer's send-time
+    // include flag reads, and mirror it onto <body> so the CSS patch can dim the file chip
+    // while context is off (the chip itself stays — it is what shows which file is current,
+    // and what the X button removes). Turning context back on also re-publishes the current
+    // selection when the chip was dismissed, clearing upstream's `dismissedSelection` memory
+    // first — otherwise the next update for that same file is swallowed.
+    `if(globalThis.__ccaaContextOn===void 0)globalThis.__ccaaContextOn=${contextOnByDefault ? '!0' : '!1'};` +
+    `var __ccaaMarkCtx=()=>{try{document.body.dataset.ccaaContext=globalThis.__ccaaContextOn?"on":"off"}catch(__ccaaMe){}};` +
+    `__ccaaMarkCtx();` +
+    `globalThis.__ccaaToggleContext=()=>{try{` +
+    `globalThis.__ccaaContextOn=!globalThis.__ccaaContextOn;__ccaaMarkCtx();` +
+    `if(globalThis.__ccaaContextOn&&${sessionVar}.selection.value===void 0){` +
+    `${sessionVar}.dismissedSelection=void 0;` +
+    `var __ccaaSel=${sessionVar}.context?.currentSelection?.value;` +
+    `if(__ccaaSel!==void 0)${sessionVar}.selection.value=__ccaaSel}` +
+    `}catch(__ccaaCtxE){}};` +
     `if(!globalThis.__ccaaModelKeyBound){globalThis.__ccaaModelKeyBound=!0;` +
     `window.addEventListener("keydown",(__ccaaE)=>{` +
     `if(!(__ccaaE.ctrlKey&&!__ccaaE.metaKey&&!__ccaaE.altKey&&!__ccaaE.shiftKey))return;` +
@@ -355,6 +331,7 @@ function injectModelUi(content) {
     `else if(__ccaaE.key==="2"){__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaSendWithModel?.(/sonnet/i)}` +
     `else if(__ccaaE.key==="3"){__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaSendWithModel?.(/haiku/i)}` +
     `else if(__ccaaE.key==="0"){__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaSendWithModel?.(/fable/i)}` +
+    `else if(__ccaaE.key==="f"||__ccaaE.key==="F"){__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaToggleContext?.()}` +
     `},!0)}` +
     `}catch(__ccaaErr2){}/*__ccaaModelUiEnd*/`;
 
@@ -378,7 +355,7 @@ function injectSendModelButtons(content) {
   // trailing child via an alternation, so a future switch between the two degrades to a skip,
   // not a mismatch. Everything in between (the submit/interrupt handler) is the stable anchor.
   const anchorRe =
-    /([\w$]+(?:\.[\w$]+)*)\("button",\{type:"submit",disabled:!([\w$]+)\.busy\.value&&!([\w$]+),className:([\w$]+)\.sendButton,"data-permission-mode":[\w$]+,onClick:\(([\w$]+)\)=>\{if\(\2\.busy\.value&&!\3\)\5\.preventDefault\(\),\2\.interrupt\(\)\}(?:\},([\w$]+)\)|,children:([\w$]+)\}\))/g;
+    /([\w$]+(?:\.[\w$]+)*)\("button",\{type:"submit",disabled:!([\w$]+)\.busy\.value&&!([\w$]+),className:([\w$]+)\.sendButton,"data-permission-mode":[\w$]+,(?:"aria-label":[\w$]+,)?onClick:\(([\w$]+)\)=>\{if\(\2\.busy\.value&&!\3\)\5\.preventDefault\(\),\2\.interrupt\(\)\}(?:\},([\w$]+)\)|,children:([\w$]+)\}\))/g;
   const matches = [...content.matchAll(anchorRe)];
   if (matches.length === 0) {
     return { ok: false, reason: 'send button site not found (Claude Code internals may have changed)' };
@@ -442,9 +419,12 @@ const URI_OPEN_WV_SENTINEL_RE = /\/\*__ccaaUriOpenWv\*\/[\s\S]*?\/\*__ccaaUriOpe
 // actually shows that session, which is how a broadcast (used when the panel already existed)
 // still lands in exactly one panel. `strict` marks that broadcast: the match then has 5s to
 // happen, otherwise this panel is not the target. A nonce set dedupes the delivery retries.
-// Injected at the app bootstrap, the one spot where the session store is in scope. The
-// bootstrap call is a plain statement up to 2.1.257 but an `if(…)` operand since 2.1.261, so
-// the listener is registered by an IIFE joined with the comma operator — valid in both spots.
+// Injected at the app bootstrap, the one spot where the session store is in scope. That call
+// keeps changing shape around it — a plain statement up to 2.1.257, an `if(…)` operand in
+// 2.1.261, an assignment inside one since 2.1.270 — and each shape wants a different join
+// (a leading comma would have silently stolen the assignment's value). So the IIFE rides
+// along as a second argument to listSessions instead, which ignores it: an argument list is
+// an expression position no matter what surrounds the call.
 function injectUriOpenListener(content) {
   const anchorRe = /([\w$]+)\.listSessions\("panel_boot"\)\.then/g;
   const matches = [...content.matchAll(anchorRe)];
@@ -455,14 +435,9 @@ function injectUriOpenListener(content) {
     return { ok: false, reason: `ambiguous: ${matches.length} panel_boot bootstraps found` };
   }
 
-  const [whole, storeVar] = matches[0];
-  // Only prepend where an expression may start; anything else would need a different join.
-  const before = content[matches[0].index - 1];
-  if (!/[;(,{}]/.test(before ?? '')) {
-    return { ok: false, reason: `panel_boot bootstrap preceded by unexpected "${before}" (Claude Code internals may have changed)` };
-  }
+  const [, storeVar] = matches[0];
   const insertion =
-    `/*__ccaaUriOpenWv*/(()=>{try{if(!window.IS_SIDEBAR&&!globalThis.__ccaaUriOpenBound){globalThis.__ccaaUriOpenBound=!0;` +
+    `/*__ccaaUriOpenWv*/,(()=>{try{if(!window.IS_SIDEBAR&&!globalThis.__ccaaUriOpenBound){globalThis.__ccaaUriOpenBound=!0;` +
     `var __ccaaUriSeen=new Set;` +
     `window.addEventListener("message",(__ccaaUriEv)=>{try{` +
     `var __ccaaUriMsg=__ccaaUriEv.data;` +
@@ -487,9 +462,12 @@ function injectUriOpenListener(content) {
     `if(!__ccaaUriBtn||__ccaaUriBtn.disabled||!__ccaaUriBtn.form)return;` +
     `clearInterval(__ccaaUriTimer);__ccaaUriBtn.form.requestSubmit()` +
     `}catch(__ccaaUriE1){clearInterval(__ccaaUriTimer)}},250)` +
-    `}catch(__ccaaUriE2){}})}}catch(__ccaaUriE3){}})(),/*__ccaaUriOpenWvEnd*/`;
+    `}catch(__ccaaUriE2){}})}}catch(__ccaaUriE3){}})()/*__ccaaUriOpenWvEnd*/`;
 
-  return { ok: true, content: replaceMatch(content, matches[0], insertion + whole) };
+  return {
+    ok: true,
+    content: replaceMatch(content, matches[0], `${storeVar}.listSessions("panel_boot"${insertion}).then`),
+  };
 }
 
 const MOUNT_FOCUS_REVERT_RE = /\/\*__ccaaMountFocus:([^*]*)\*\/[\w$]+\.current\?\.focus\(\)/;
@@ -795,11 +773,13 @@ const SESSION_MODEL_SENTINEL_RE = /\/\*__ccaaSessionModel\*\/[\s\S]*?\/\*__ccaaS
 // per-model effort from `modelSettings`), so the same is read back via getSettings — best
 // effort, the switch itself never depends on it.
 function injectSessionScopedModel(content) {
-  // Anchor on the signature plus the immediate writeUserSettingsAndPush(channel,{model:…})
-  // call; the body around it differs between releases (`return await …,{type:…}` up to
-  // 2.1.257, `let Q=await …;return{type:…,...Q!==void 0&&{applied:Q}}` since 2.1.261).
+  // Anchor on the writeUserSettingsAndPush(channel,{model:…}) statement itself rather than
+  // the method signature: 2.1.270 put a malformed-request guard in front of it, so the
+  // signature is no longer adjacent to the write — and the early return has to sit *after*
+  // that guard anyway. The `{model:…}` argument shape is what keeps the match unique, and
+  // the leading `let …=await`/`return await` pins it to a statement boundary.
   const anchorRe =
-    /async setModel\(([\w$]+),([\w$]+)\)\{(?=(?:return await |let [\w$]+=await )this\.writeUserSettingsAndPush\(\1,\{model:\2\.value==="default"\?null:\2\.value\}\))/g;
+    /(?:return await |let [\w$]+=await )this\.writeUserSettingsAndPush\(([\w$]+),\{model:([\w$]+)\.value==="default"\?null:\2\.value\}\)/g;
   const matches = [...content.matchAll(anchorRe)];
   if (matches.length === 0) {
     return { ok: false, reason: 'setModel anchor not found (Claude Code internals may have changed)' };
@@ -817,7 +797,7 @@ function injectSessionScopedModel(content) {
     `var __ccaaApplied;try{__ccaaApplied=(await __ccaaChannel.query.getSettings())?.applied}catch(__ccaaErr3){}` +
     `return{type:"set_model_response",...__ccaaApplied!==void 0&&{applied:__ccaaApplied}}});` +
     `/*__ccaaSessionModelEnd*/`;
-  return { ok: true, content: replaceMatch(content, matches[0], anchor + insertion) };
+  return { ok: true, content: replaceMatch(content, matches[0], insertion + anchor) };
 }
 
 const SESSION_EFFORT_SENTINEL_RE = /\/\*__ccaaSessionEffort\*\/[\s\S]*?\/\*__ccaaSessionEffortEnd\*\//g;
@@ -834,10 +814,14 @@ const SESSION_EFFORT_SENTINEL_RE = /\/\*__ccaaSessionEffort\*\/[\s\S]*?\/\*__cca
 // project's settings.local.json and rejects flagsOnly), so the override only fires when no
 // scope is given — the effort picker never passes one.
 function injectSessionScopedEffort(content) {
-  // Anchor on the signature plus the immediate writeUserSettingsAndPush(channel,settings,flags…)
-  // call; the body around it differs between releases (`return await …` vs `if(await …`).
+  // Anchor on the writeUserSettingsAndPush(channel,settings,flags…) statement, not the
+  // method signature. 2.1.270 added a validation prologue that derives the target layer
+  // from the flags argument (`let Y=X?"flags":…`) and throws when it disagrees with the
+  // setting's own layer — and effortLevel is declared as "userSettings". Flipping the flag
+  // before that loop would make every effort change throw, so the flip has to land after
+  // it, immediately before the write.
   const anchorRe =
-    /async applySettings\(([\w$]+),([\w$]+),([\w$]+)(?:,([\w$]+))?\)\{(?=(?:return |if\()await this\.writeUserSettingsAndPush\(\1,\2,\3[,)])/g;
+    /(?:return |if\()await this\.writeUserSettingsAndPush\(([\w$]+),([\w$]+),([\w$]+)(?:,([\w$]+))?[,)]/g;
   const matches = [...content.matchAll(anchorRe)];
   if (matches.length === 0) {
     return { ok: false, reason: 'applySettings anchor not found (Claude Code internals may have changed)' };
@@ -854,7 +838,7 @@ function injectSessionScopedEffort(content) {
     `if(__ccaaEffKeys.length===1&&__ccaaEffKeys[0]==="effortLevel"&&` +
     `require("vscode").workspace.getConfiguration("claude-code-no-auto-attach").get("sessionScopedEffortSwitch",true))` +
     `${flagsVar}=!0}}catch(__ccaaEffErr){}/*__ccaaSessionEffortEnd*/`;
-  return { ok: true, content: replaceMatch(content, matches[0], anchor + insertion) };
+  return { ok: true, content: replaceMatch(content, matches[0], insertion + anchor) };
 }
 
 const MD_PREVIEW_SENTINEL_RE = /\/\*__ccaaMdPreview\*\/[\s\S]*?\/\*__ccaaMdPreviewEnd\*\//g;
@@ -988,15 +972,10 @@ function computeWebviewPatch(content, { detachContextByDefault = true } = {}) {
     return { patched: false, reason: 'already patched' };
   }
   const subPatches = [];
-  // Default the include-selection toggle to OFF only when the setting allows it; when off,
-  // the upstream "attached by default" behavior is kept (the Ctrl+F toggle still works).
-  if (detachContextByDefault) {
-    subPatches.push({ name: 'attach-toggle-off', inject: injectAttachToggleOff });
-  }
+  const contextOnByDefault = !detachContextByDefault;
   subPatches.push(
-    { name: 'model-badge-and-shortcut', inject: injectModelUi },
-    { name: 'context-toggle-shortcut', inject: injectContextToggleShortcut },
-    { name: 'slash-keeps-selection', inject: injectSlashKeepsSelection },
+    { name: 'model-badge-and-shortcut', inject: (c) => injectModelUi(c, { contextOnByDefault }) },
+    { name: 'context-send-flag', inject: (c) => injectContextSendFlag(c, { contextOnByDefault }) },
     { name: 'send-model-buttons', inject: injectSendModelButtons },
     { name: 'hide-rate-limit-warning', inject: injectHideRateLimitWarning },
     { name: 'uri-open-listener', inject: injectUriOpenListener },
@@ -1012,16 +991,13 @@ function revertWebviewPatch(content) {
   const stripped = stripMarker(content);
   if (stripped === null) return { reverted: false, reason: 'not patched' };
 
-  // Revert the context toggle first so the attach-toggle anchor (which reads the clean
-  // onToggleIncludeSelection prop) resolves again.
-  let next = revertContextToggle(stripped);
-  next = revertSlashKeepsSelection(next);
+  let next = revertLegacySelectionPatches(stripped);
+  next = revertContextSendFlag(next);
   next = revertHideRateLimitWarning(next);
   next = revertSessionMountFocus(next);
   next = revertAskQuestionFocus(next);
   next = revertAskQuestionNotes(next);
   next = revertQuestionAutoAdvance(next);
-  next = revertAttachToggleOff(next);
   next = next.replace(MODEL_UI_SENTINEL_RE, '');
   next = next.replace(SEND_MODEL_BUTTONS_SENTINEL_RE, '');
   next = next.replace(URI_OPEN_WV_SENTINEL_RE, '');
@@ -1046,7 +1022,23 @@ function computePromptHeightPatch(content) {
   const css =
     `\n/*__ccaaPromptHeight*/` +
     `[class*="userMessage_"]{max-height:40vh;overflow-y:auto;scrollbar-width:thin}` +
-    `button[title^="Showing Claude your current file selection"]{color:#d97757}` +
+    // 2.1.270 turned the selection toggle into a dismissible chip (a span, not a button).
+    // The chip now always shows the current file; whether that file is actually sent is the
+    // Ctrl+F flag, which the model-UI patch mirrors onto <body>. Colour the chip orange when
+    // context is on and dim it when off, so the state is visible again. Without that patch
+    // no marker is set and the chip keeps its stock appearance.
+    `body[data-ccaa-context="on"] [title^="Showing Claude your current file selection"]{color:#d97757}` +
+    `body[data-ccaa-context="off"] [title^="Showing Claude your current file selection"]{opacity:.45}` +
+    // Hide the permission-mode pill. The composer footer got crowded (agent map, cache
+    // window, selection chip, model pill) and the mode is still reachable with Shift+Tab,
+    // which the pill's own tooltip is the only stable way to recognise it by. The wrapper
+    // goes too, so the footer's flex gap does not leave a hole; both rules are no-ops if
+    // the markup or the tooltip text changes.
+    `[title*="Shift+Tab to cycle"]{display:none!important}` +
+    `div:has(>[title*="Shift+Tab to cycle"]){display:none!important}` +
+    // Trim the send buttons (upstream's, plus the three model buttons injected next to it)
+    // from 26px to 22px — same reason, the row has to fit more than it used to.
+    `[class*="sendButton_"]{width:22px!important;height:22px!important}` +
     // Keep the model picker on the composer footer row. The footer measures its
     // children and, once they no longer fit, moves the model pill to a row of its
     // own. Upstream caps the file-selection label at 200px, which — with the extra
@@ -1098,7 +1090,7 @@ const PATCH_SITES = [
   {
     relativePath: ['webview', 'index.js'],
     description:
-      'attach toggle OFF + per-session model badge + Ctrl+M model cycle + Ctrl+F context toggle + hide rate-limit warnings + uri-open panel listener + questions keep your focus',
+      'context detached by default + per-session model badge + Ctrl+M model cycle + Ctrl+F context toggle + hide rate-limit warnings + uri-open panel listener + questions keep your focus',
     compute: computeWebviewPatch,
     revert: revertWebviewPatch,
     syntaxCheck: true,
