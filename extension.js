@@ -805,7 +805,10 @@ const SESSION_MODEL_SENTINEL_RE = /\/\*__ccaaSessionModel\*\/[\s\S]*?\/\*__ccaaS
 // switching only affects the current session. Since 2.1.261 the response also carries the
 // CLI's `applied` settings (the webview adopts `applied.effort` after a switch, e.g. a
 // per-model effort from `modelSettings`), so the same is read back via getSettings — best
-// effort, the switch itself never depends on it.
+// effort, the switch itself never depends on it. That read-back sits in the latency of every
+// switch, and the quick-send shortcuts wait for the whole switch before submitting, so it is
+// raced against a 200ms timeout: a CLI that answers in time still feeds `applied`, a slow one
+// costs 200ms instead of however long it takes.
 function injectSessionScopedModel(content) {
   // Anchor on the writeUserSettingsAndPush(channel,{model:…}) statement itself rather than
   // the method signature: 2.1.270 put a malformed-request guard in front of it, so the
@@ -828,7 +831,10 @@ function injectSessionScopedModel(content) {
     `try{__ccaaScoped=require("vscode").workspace.getConfiguration("claude-code-no-auto-attach").get("sessionScopedModelSwitch",true)}catch(__ccaaErr2){}` +
     `if(__ccaaScoped)return await this.withChannel(${channelVar},async(__ccaaChannel)=>{` +
     `await __ccaaChannel.query.setModel(${modelVar}.value==="default"?void 0:${modelVar}.value);` +
-    `var __ccaaApplied;try{__ccaaApplied=(await __ccaaChannel.query.getSettings())?.applied}catch(__ccaaErr3){}` +
+    `var __ccaaApplied;try{` +
+    `var __ccaaRead=__ccaaChannel.query.getSettings().catch(()=>void 0);` +
+    `__ccaaApplied=(await Promise.race([__ccaaRead,new Promise((__ccaaRs)=>setTimeout(__ccaaRs,200))]))?.applied` +
+    `}catch(__ccaaErr3){}` +
     `return{type:"set_model_response",...__ccaaApplied!==void 0&&{applied:__ccaaApplied}}});` +
     `/*__ccaaSessionModelEnd*/`;
   return { ok: true, content: replaceMatch(content, matches[0], insertion + anchor) };
