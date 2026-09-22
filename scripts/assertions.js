@@ -46,6 +46,23 @@ const sameWindows = (a, b) => a.length === b.length && a.every((w, i) => w === b
 const atLeast = (semver, min) =>
   semver[0] !== min[0] ? semver[0] > min[0] : semver[1] !== min[1] ? semver[1] > min[1] : semver[2] >= min[2];
 
+// The appended VSCode system prompt as the model actually receives it: every
+// /*__ccaaPromptEdit*/(0?`original`:`replacement`) splice collapsed to its live branch,
+// then the `# VSCode Extension Context` template literal read to its closing backtick
+// (the one that is not escaped — the prompt itself mentions a `\`` in its own text).
+const appendedPrompt = (content) => {
+  const live = content.replace(
+    /`\+\/\*__ccaaPromptEdit\*\/\(0\?`[\s\S]*?`:`([\s\S]*?)`\)\+\/\*__ccaaPromptEditEnd\*\/`/g,
+    (_, replacement) => replacement
+  );
+  const start = live.indexOf('# VSCode Extension Context');
+  if (start === -1) return null;
+  for (let i = start; i < live.length; i += 1) {
+    if (live[i] === '`' && live[i - 1] !== '\\') return live.slice(start, i);
+  }
+  return null;
+};
+
 // --- webview/index.js ---
 
 const WEBVIEW = [
@@ -405,6 +422,51 @@ const EXTENSION = [
     },
   },
   {
+    // The prompt the model receives must ask for absolute links and keep the three
+    // sections that earn their place — clickable paths, the IDE selection, and the Focus
+    // view rules, which override the terminal Focus-mode ones that also reach the prompt.
+    name: 'system-prompt-trim',
+    rel: 'extension.js',
+    check(patched) {
+      const prompt = appendedPrompt(patched);
+      if (prompt === null) return 'the appended VSCode prompt literal is not readable after patching';
+      if (prompt.includes('relative paths from the root of')) {
+        return 'the prompt still asks for links relative to the workspace root';
+      }
+      return need(prompt, [
+        ['the absolute-path rule', 'The URL links should be absolute paths'],
+        ['the code-reference section', '## Code References in Text'],
+        ['the IDE selection section', '## User Selection Context'],
+        ['the Focus view section', '## Focus view in this editor'],
+      ]);
+    },
+  },
+  {
+    // The audience preamble is what makes ordinary replies open with "Written for: …".
+    // It arrived in 2.1.270; older bundles have nothing to drop.
+    name: 'system-prompt-trim-audience',
+    rel: 'extension.js',
+    applies: (clean) => clean.includes('## Who you are writing for'),
+    check(patched) {
+      const prompt = appendedPrompt(patched);
+      if (prompt === null) return 'the appended VSCode prompt literal is not readable after patching';
+      if (prompt.includes('## Who you are writing for')) return 'the audience section is still in the prompt';
+      return prompt.includes('Written for:') ? 'the "Written for: …" instruction survives the trim' : null;
+    },
+  },
+  {
+    // Upstream drift canary for the section the trim above removes: a rename would make
+    // that edit a silent no-op, since the other edit alone still counts as applied.
+    name: 'upstream-affordances-prompt',
+    rel: 'extension.js',
+    applies: (_clean, ctx) => atLeast(ctx.semver, [2, 1, 270]),
+    check: (_patched, clean) =>
+      need(clean, [
+        ['the audience section', '\n\n## Who you are writing for\n'],
+        ['the audience "Written for" line', 'Written for:'],
+      ]),
+  },
+  {
     name: 'upstream-affordances',
     rel: 'extension.js',
     check: (_patched, clean) =>
@@ -415,6 +477,8 @@ const EXTENSION = [
         ['the uri /open fallback', 'primaryEditor.open'],
         ['the editor-open command', 'claude-vscode.editor.open'],
         ['the active-editor subscription', 'onDidChangeActiveTextEditor'],
+        ['the appended VSCode prompt', '# VSCode Extension Context'],
+        ['the workspace-relative link rule', 'The URL links should be relative paths'],
       ]),
   },
 ];

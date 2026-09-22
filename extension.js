@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const vm = require('vm');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v52*/';
+const MARKER = '/*claude-code-no-auto-attach:v53*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -974,6 +974,85 @@ function injectMarkdownPreviewContext(content) {
   return { ok: true, content: content.replace(whole, () => replacement) };
 }
 
+const PROMPT_EDIT_RE = /`\+\/\*__ccaaPromptEdit\*\/\(0\?`([\s\S]*?)`:`[\s\S]*?`\)\+\/\*__ccaaPromptEditEnd\*\/`/g;
+
+// Rewrite passages of the system prompt this extension appends to every session — the
+// `# VSCode Extension Context` block, which is one template literal. Esbuild keeps real
+// newlines inside it, so the anchors are written with real newlines too.
+//
+// Removing text leaves nothing to revert from, so instead of cutting, the literal is split
+// and the original parked in a dead branch beside the replacement:
+//   `…before` + /*__ccaaPromptEdit*/(0?`original`:`replacement`) + /*__ccaaPromptEditEnd*/ `after…`
+// The ternary is constant-false, so the model only ever sees the replacement, and the
+// revert splices the parked original back into a single literal — byte for byte.
+//
+// Only plain prose can be parked: a backtick, a backslash or a template placeholder would
+// mean something else once it sits inside a literal of ours, so those bail out.
+function parkPromptEdit(content, match, replacement) {
+  const original = match[0];
+  if (/[`\\]|\$\{/.test(original)) return null;
+  const spliced = '`+/*__ccaaPromptEdit*/(0?`' + original + '`:`' + replacement + '`)+/*__ccaaPromptEditEnd*/`';
+  return replaceMatch(content, match, spliced);
+}
+
+// What the "Code References in Text" section asks for instead. Upstream wants links
+// relative to the workspace root, which cannot name a file outside it — a worktree checked
+// out beside the workspace, say — so the model either invents a path or drops the link.
+const PROMPT_ABSOLUTE_LINKS =
+  'The URL links should be absolute paths (e.g. ' +
+  '[filename.ts:42](/Users/me/repos/project/src/filename.ts#L42)), ' +
+  'so they resolve whatever the current VSCode workspace is.';
+
+// Two edits to that prompt:
+//   - drop the "Who you are writing for" section (new in 2.1.270), which makes the model
+//     open ordinary replies with a "Written for: …" line — the rule is meant for pieces
+//     written for a third party and misfires on everything else;
+//   - swap the workspace-relative link rule for an absolute-path one.
+// The other three sections stay: "Code References in Text" is what makes paths clickable,
+// and "Focus view in this editor" is load-bearing — it overrides the terminal Focus-mode
+// rules that also reach the prompt.
+//
+// The edits are independent. 2.1.263 has no "Who you are writing for" section, so that one
+// finds nothing and is left out; the sub-patch only fails when neither edit lands.
+function injectSystemPromptTrim(content) {
+  const edits = [
+    ['the "Who you are writing for" section', /\n\n## Who you are writing for\n[\s\S]*?(?=\n\n## )/g, ''],
+    [
+      'the workspace-relative link rule',
+      /The URL links should be relative paths from the root of\s+the user's workspace\./g,
+      PROMPT_ABSOLUTE_LINKS,
+    ],
+  ];
+
+  const skipped = [];
+  let next = content;
+  let applied = 0;
+
+  for (const [label, anchorRe, replacement] of edits) {
+    const matches = [...next.matchAll(anchorRe)];
+    if (matches.length !== 1) {
+      skipped.push(`${label}: ${matches.length === 0 ? 'not found' : `ambiguous, ${matches.length} matches`}`);
+      continue;
+    }
+    const spliced = parkPromptEdit(next, matches[0], replacement);
+    if (spliced === null) {
+      skipped.push(`${label}: holds a backtick, a backslash or a placeholder and cannot be parked`);
+      continue;
+    }
+    next = spliced;
+    applied += 1;
+  }
+
+  if (applied === 0) {
+    return { ok: false, reason: `appended system prompt not rewritten (${skipped.join('; ')})` };
+  }
+  return { ok: true, content: next };
+}
+
+function revertSystemPromptTrim(content) {
+  return content.replace(PROMPT_EDIT_RE, (_, original) => original);
+}
+
 // --- per-file compute/revert ---
 
 // Apply the sub-patches one by one. Each result is parsed before it is kept: an anchor can
@@ -1110,6 +1189,7 @@ function computeExtensionPatch(content) {
     { name: 'session-scoped-effort', inject: injectSessionScopedEffort },
     { name: 'markdown-preview-context', inject: injectMarkdownPreviewContext },
     { name: 'uri-open-in-editor', inject: injectUriOpenInEditor },
+    { name: 'system-prompt-trim', inject: injectSystemPromptTrim },
   ]);
 }
 
@@ -1125,6 +1205,7 @@ function revertExtensionPatch(content) {
   next = next.replace(MD_PREVIEW2_SENTINEL_RE, '');
   next = next.replace(MD_PREVIEW3_SENTINEL_RE, '');
   next = next.replace(URI_OPEN_EXT_SENTINEL_RE, '');
+  next = revertSystemPromptTrim(next);
   return { reverted: true, content: next };
 }
 
@@ -1145,7 +1226,7 @@ const PATCH_SITES = [
   },
   {
     relativePath: ['extension.js'],
-    description: 'auto-allow gitignored Write/Edit prompts (bypass mode only) + capture permission mode + session-scoped model + session-scoped effort switch + uri /open in the Claude editor group',
+    description: 'auto-allow gitignored Write/Edit prompts (bypass mode only) + capture permission mode + session-scoped model + session-scoped effort switch + uri /open in the Claude editor group + trimmed appended system prompt',
     compute: computeExtensionPatch,
     revert: revertExtensionPatch,
     syntaxCheck: true,

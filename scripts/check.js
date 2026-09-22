@@ -78,7 +78,7 @@ const OPTIONS = { detachContextByDefault: true };
 const MARKER_LINE_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 // Markers this extension has shipped under before the current one. Each stands for a
 // bundle already patched by an older build, which is what applyPatch meets on an update.
-const OLD_MARKERS = ['/*claude-code-no-auto-attach:v1*/', '/*claude-code-no-auto-attach:v48*/', '/*claude-code-no-auto-attach:v50*/'];
+const OLD_MARKERS = ['/*claude-code-no-auto-attach:v1*/', '/*claude-code-no-auto-attach:v48*/', '/*claude-code-no-auto-attach:v50*/', '/*claude-code-no-auto-attach:v52*/'];
 
 // Patching an already-patched bundle must land exactly where patching the clean one does.
 // It is the revert that has to hold that up, so this catches a sub-patch whose revert
