@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const vm = require('vm');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v54*/';
+const MARKER = '/*claude-code-no-auto-attach:v55*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -146,11 +146,12 @@ const RATE_LIMIT_REVERT_RE =
 // a decision helper ("clear"/"show"/"keep-hidden") and builds the banner in the "show"
 // branch — assigned directly to rateLimitWarning/shownRateLimitKey in 2.1.251, and since
 // 2.1.257 to frameRateLimitWarning/shownRateLimit inside a signal batch (`$H(()=>{…})`);
-// older bundles assigned it directly behind a dismissedRateLimitKey check. Either way the
+// older bundles assigned it directly behind a dismissedRateLimitKey check. 2.1.280 passes the
+// builder a second argument (an experiment gate), matched optionally. Either way the
 // builder call is wrapped in the same sentinel conditional, so one revert regex covers all.
 function injectHideRateLimitWarning(content) {
   const showBranchRe =
-    /else if\(([\w$]+)==="show"\)\{let ([\w$]+)=([\w$]+\(([\w$]+)\));(?:[\w$]+\(\(\)=>\{)?this\.(?:frame)?[rR]ateLimitWarning\.value=\2,this\.shownRateLimit(?:Key)?(?:\.value)?=\2===null\?null:/g;
+    /else if\(([\w$]+)==="show"\)\{let ([\w$]+)=([\w$]+\(([\w$]+)(?:,[^;()]*)?\));(?:[\w$]+\(\(\)=>\{)?this\.(?:frame)?[rR]ateLimitWarning\.value=\2,this\.shownRateLimit(?:Key)?(?:\.value)?=\2===null\?null:/g;
   const showMatches = [...content.matchAll(showBranchRe)];
   if (showMatches.length === 1) {
     const [whole, , resultVar, call, infoVar] = showMatches[0];
@@ -694,12 +695,13 @@ const URI_OPEN_EXT_SENTINEL_RE = /\/\*__ccaaUriOpenExt\*\/[\s\S]*?\/\*__ccaaUriO
 // off or anything throws.
 function injectUriOpenInEditor(content) {
   // Anchor spans the tail of the /install-plugin case (to capture the webview-manager var
-  // off its notifyOpenPluginsDialog call — the only manager reference in the handler) and
-  // the whole /open case. 2.1.257 added a session-id validation between the parameter reads
-  // and the open call (`if(x!==void 0&&!SH(x))return;`); it is matched optionally and kept
-  // in place, so the injected code still runs after it.
+  // off its plugins-dialog call — the only manager reference in the handler) and the whole
+  // /open case. 2.1.280 replaced `openLast().then(()=>{m.notifyOpenPluginsDialog(a,b)})` with
+  // a direct `m.openPluginsDialogInChat(a,b)`; both are matched. 2.1.257 added a session-id
+  // validation between the parameter reads and the open call (`if(x!==void 0&&!SH(x))return;`);
+  // it is matched optionally and kept in place, so the injected code still runs after it.
   const anchorRe =
-    /([\w$]+)\.notifyOpenPluginsDialog\([\w$]+,[\w$]+\)\}\);return\}case"\/open":\{let ([\w$]+)=([\w$]+)\.get\("session"\)\?\?void 0,([\w$]+)=\3\.get\("prompt"\)\?\?void 0;(?:if\(\2!==void 0&&![\w$]+\(\2\)\)return;)?([\w$]+)\.commands\.executeCommand\("claude-vscode\.primaryEditor\.open",\2,\4\);return\}/g;
+    /([\w$]+)\.(?:notifyOpenPluginsDialog|openPluginsDialogInChat)\([\w$]+,[\w$]+\)(?:\}\))?;return\}case"\/open":\{let ([\w$]+)=([\w$]+)\.get\("session"\)\?\?void 0,([\w$]+)=\3\.get\("prompt"\)\?\?void 0;(?:if\(\2!==void 0&&![\w$]+\(\2\)\)return;)?([\w$]+)\.commands\.executeCommand\("claude-vscode\.primaryEditor\.open",\2,\4\);return\}/g;
   const matches = [...content.matchAll(anchorRe)];
   if (matches.length === 0) {
     return { ok: false, reason: 'uri /open handler not found (Claude Code internals may have changed)' };
@@ -737,8 +739,10 @@ function injectUriOpenInEditor(content) {
     // Claude groups are meant to stay locked; stock only locks a group it had to create. The
     // panel takes focus, so the group it landed in is the active one, and locking is a no-op
     // when it already is. Never the last remaining group — locking that one traps the editor.
+    // Upstream's claudeCode.lockEditorGroups (2.1.274+) turned off means no lock here either.
     `try{var __ccaaUriGroup=${vscodeNs}.window.tabGroups.activeTabGroup;` +
-    `if(${vscodeNs}.window.tabGroups.all.length>1&&__ccaaUriGroup&&__ccaaUriGroup.tabs.some(__ccaaUriIsCC))` +
+    `if(${vscodeNs}.workspace.getConfiguration("claudeCode").get("lockEditorGroups")!==!1&&` +
+    `${vscodeNs}.window.tabGroups.all.length>1&&__ccaaUriGroup&&__ccaaUriGroup.tabs.some(__ccaaUriIsCC))` +
     `${vscodeNs}.commands.executeCommand("workbench.action.lockEditorGroup")}catch(__ccaaUriE4){}` +
     `if(!${promptVar})return;` +
     `var __ccaaUriAll=[...__ccaaUriViews].filter((__ccaaUriV)=>__ccaaUriV.isChatSurface);` +

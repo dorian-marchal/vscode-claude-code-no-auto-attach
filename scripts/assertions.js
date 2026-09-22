@@ -386,6 +386,8 @@ const EXTENSION = [
         ['the editor.open command', '"claude-vscode.editor.open"'],
         ['the resolved Claude group column', '__ccaaUriCol'],
         ['the ccaa-open message', '"ccaa-open"'],
+        ['the group lock', '"workbench.action.lockEditorGroup"'],
+        ['the upstream lock opt-out', 'getConfiguration("claudeCode").get("lockEditorGroups")!==!1'],
       ]);
       if (problem) return problem;
       const tail = patched.slice(patched.indexOf('/*__ccaaUriOpenExtEnd*/'));
