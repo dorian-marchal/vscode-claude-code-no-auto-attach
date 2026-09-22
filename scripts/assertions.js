@@ -467,10 +467,32 @@ const EXTENSION = [
       ]),
   },
   {
+    // The close API has to reach the panel through the manager's own session map: from
+    // outside, every session tab is the same claudeVSCodePanel webview, so nothing else
+    // can tell which tab holds which session. And it must answer false in a window that
+    // does not hold it — that is what lets every window try the same id in turn.
+    name: 'close-panel-api',
+    rel: 'extension.js',
+    check(patched) {
+      const injected = block(patched, 'CloseApi');
+      if (!injected) return 'no close-api block in the patched bundle';
+      if (!patched.includes('sessionPanels=new Map;/*__ccaaCloseApi*/')) {
+        return 'the close api is not declared beside the session map, so `this` may not be the manager';
+      }
+      return need(injected, [
+        ['the global other extensions call', 'globalThis.__ccaaClosePanel='],
+        ['the session lookup', 'this.sessionPanels.get('],
+        ['the panel disposal', '__ccaaPanel.dispose()'],
+        ['the "not in this window" answer', 'if(!__ccaaPanel)return!1'],
+      ]);
+    },
+  },
+  {
     name: 'upstream-affordances',
     rel: 'extension.js',
     check: (_patched, clean) =>
       need(clean, [
+        ['the session panel map', 'sessionPanels=new Map;'],
         ['the tool-permission request', 'can_use_tool'],
         ['the permission-mode setter', 'setPermissionMode'],
         ['the settings write', 'writeUserSettingsAndPush'],

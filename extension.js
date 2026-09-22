@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const vm = require('vm');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v53*/';
+const MARKER = '/*claude-code-no-auto-attach:v54*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -754,6 +754,44 @@ function injectUriOpenInEditor(content) {
   return { ok: true, content: replaceMatch(content, matches[0], whole.replace(originalTail, () => insertion + originalTail)) };
 }
 
+const CLOSE_API_SENTINEL_RE = /\/\*__ccaaCloseApi\*\/[\s\S]*?\/\*__ccaaCloseApiEnd\*\//g;
+
+// Expose "close the tab of session X" to the other extensions in this window.
+//
+// A session's panel is only reachable through the webview manager's own sessionPanels map
+// (sessionId -> WebviewPanel); from outside, every session tab is an indistinguishable
+// TabInputWebview whose viewType is mainThreadWebview-claudeVSCodePanel, so the tab API
+// alone can never tell which tab holds which session. Disposing the panel is what closing
+// the tab by hand does: upstream's onDidDispose shuts the session's channels down and files
+// it under "Reopen Closed Session", so this cuts the session and leaves it reopenable.
+//
+// The global is what att's marker extension calls (extensions in a window share one
+// extension host, so they share globalThis). A window that does not hold the session
+// returns false rather than guessing, which is what lets every window try in turn.
+function injectClosePanelApi(content) {
+  // The manager's class field declaration: a field initializer runs with `this` bound to
+  // the instance, so the arrow function closes over the manager itself — no dependence on
+  // the minified class name or on any method around it.
+  const anchorRe = /sessionPanels=new Map;/g;
+  const matches = [...content.matchAll(anchorRe)];
+  if (matches.length === 0) {
+    return { ok: false, reason: 'sessionPanels map not found (Claude Code internals may have changed)' };
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${matches.length} sessionPanels maps found` };
+  }
+
+  // The global is set from a field of our own, since a class body holds declarations and not
+  // statements; the comma expression gives that field a value. Its terminating `;` sits
+  // inside the sentinel, so stripping the block leaves the next field declared as before.
+  const injection =
+    `/*__ccaaCloseApi*/__ccaaCloseApi=(globalThis.__ccaaClosePanel=(__ccaaSid)=>{` +
+    `try{var __ccaaPanel=this.sessionPanels.get(__ccaaSid);if(!__ccaaPanel)return!1;` +
+    `__ccaaPanel.dispose();return!0}catch(__ccaaCloseE){return!1}},0);/*__ccaaCloseApiEnd*/`;
+
+  return { ok: true, content: replaceMatch(content, matches[0], matches[0][0] + injection) };
+}
+
 function injectCanUseToolGuard(content) {
   const anchorRe = /if\(([\w$]+)\.request\.subtype==="can_use_tool"\)\{if\(!this\.canUseTool\)throw Error\("canUseTool callback is not provided\."\);/g;
   const matches = [...content.matchAll(anchorRe)];
@@ -1190,6 +1228,7 @@ function computeExtensionPatch(content) {
     { name: 'markdown-preview-context', inject: injectMarkdownPreviewContext },
     { name: 'uri-open-in-editor', inject: injectUriOpenInEditor },
     { name: 'system-prompt-trim', inject: injectSystemPromptTrim },
+    { name: 'close-panel-api', inject: injectClosePanelApi },
   ]);
 }
 
@@ -1206,6 +1245,7 @@ function revertExtensionPatch(content) {
   next = next.replace(MD_PREVIEW3_SENTINEL_RE, '');
   next = next.replace(URI_OPEN_EXT_SENTINEL_RE, '');
   next = revertSystemPromptTrim(next);
+  next = next.replace(CLOSE_API_SENTINEL_RE, '');
   return { reverted: true, content: next };
 }
 
