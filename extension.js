@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const vm = require('vm');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v55*/';
+const MARKER = '/*claude-code-no-auto-attach:v57*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -188,25 +188,116 @@ function revertHideRateLimitWarning(content) {
     : content;
 }
 
+// Quick-send slots: a model + effort pair behind a Ctrl shortcut and, for three of them, a
+// colored send button next to the composer's. Listed in the order Ctrl+M cycles them. The
+// model and effort are only defaults: the quickSend.<id>.model/effort settings (same defaults
+// in package.json) override them at runtime. `model` is a family word matched against the
+// model list, or an exact model value such as "opus[1m]".
+const QUICK_SEND_SLOTS = [
+  { id: 'purple', color: '#8052d2', key: '0', button: true, model: 'fable', effort: 'high' },
+  { id: 'red', color: '#c63e3e', key: '1', button: false, model: 'opus', effort: 'xhigh' },
+  { id: 'yellow', color: '#bc8e26', key: '2', button: true, model: 'sonnet', effort: 'medium' },
+  { id: 'teal', color: '#269473', key: '3', button: true, model: 'haiku', effort: 'medium' },
+];
+
+const QUICK_SEND_LIB_SENTINEL_RE = /\/\*__ccaaQuickSendLib\*\/[\s\S]*?\/\*__ccaaQuickSendLibEnd\*\/\n/g;
+
+// Helpers shared by the badge, the shortcuts and the send buttons, put at the top of the
+// bundle so they need no anchor and exist before anything renders. The slot settings reach
+// the webview through the host's state (see injectQuickSendState); when they are missing
+// (that patch skipped), the defaults above apply.
+function injectQuickSendLib(content) {
+  const lib =
+    `/*__ccaaQuickSendLib*/(()=>{try{` +
+    `var __ccaaDefaults=${JSON.stringify(QUICK_SEND_SLOTS)};` +
+    `var __ccaaFamOf=(__ccaaS)=>(String(__ccaaS??"").toLowerCase().match(/fable|opus|sonnet|haiku/)??[null])[0];` +
+    // Since 2.1.261 the model list also carries alias entries (older spellings of a model,
+    // flagged by "alias" in their name/description — the same test upstream's picker uses to
+    // list them last). Order the real models first so a family lookup lands on the current
+    // spelling.
+    `globalThis.__ccaaIsAlias=(__ccaaM)=>/\\balias(?:es)?\\b/i.test(String(__ccaaM.displayName??"")+" "+String(__ccaaM.description??""));` +
+    `globalThis.__ccaaPickable=(__ccaaL)=>__ccaaL.filter((__ccaaM)=>!globalThis.__ccaaIsAlias(__ccaaM)).concat(__ccaaL.filter(globalThis.__ccaaIsAlias));` +
+    `globalThis.__ccaaSlots=(__ccaaSess)=>{var __ccaaCfg=__ccaaSess?.config?.value?.ccaaQuickSend;` +
+    `if(!__ccaaCfg||typeof __ccaaCfg!=="object")__ccaaCfg={};` +
+    `return __ccaaDefaults.map((__ccaaD)=>{var __ccaaC=__ccaaCfg[__ccaaD.id];if(!__ccaaC||typeof __ccaaC!=="object")__ccaaC={};` +
+    `return{...__ccaaD,model:typeof __ccaaC.model==="string"&&__ccaaC.model?__ccaaC.model:__ccaaD.model,` +
+    `effort:typeof __ccaaC.effort==="string"&&__ccaaC.effort?__ccaaC.effort:__ccaaD.effort}})};` +
+    // The model a slot points at: an exact value first, else the first whose value or name
+    // contains the slot's word. Null when the session has no such model.
+    `globalThis.__ccaaSlotTarget=(__ccaaSess,__ccaaSlot)=>{` +
+    `var __ccaaList=globalThis.__ccaaPickable(__ccaaSess.claudeConfig.value?.models??[]);` +
+    `var __ccaaWant=String(__ccaaSlot.model).toLowerCase();` +
+    `return __ccaaList.find((__ccaaM)=>String(__ccaaM.value).toLowerCase()===__ccaaWant)??` +
+    `__ccaaList.find((__ccaaM)=>(String(__ccaaM.value??"")+" "+String(__ccaaM.displayName??"")).toLowerCase().includes(__ccaaWant))??null};` +
+    // The effort a slot sets on its model, or null to leave the effort alone ("unchanged",
+    // or a level the model does not support).
+    `globalThis.__ccaaSlotEffort=(__ccaaSlot,__ccaaM)=>{var __ccaaE=__ccaaSlot.effort;` +
+    `if(!__ccaaM||!__ccaaE||__ccaaE==="unchanged"||!__ccaaM.supportsEffort)return null;` +
+    `var __ccaaLv=__ccaaM.supportedEffortLevels;return(!__ccaaLv||__ccaaLv.includes(__ccaaE))?__ccaaE:null};` +
+    // True when the session must be told to switch to the target model. modelSelection alone
+    // can't answer that: it is seeded from the *global* default model setting on launch, which
+    // the session-scoped setModel patch never writes — so a resumed session reads
+    // "opus[1m]" while the CLI is really serving Fable. Treat a served model outside the
+    // target's family as drift and switch anyway; without it a send would keep the old model
+    // yet still apply the target's effort (e.g. Fable answering at Opus' xhigh).
+    `globalThis.__ccaaNeedsSwitch=(__ccaaSess,__ccaaT)=>{` +
+    `if(__ccaaSess.modelSelection.value!==__ccaaT.value)return!0;` +
+    `var __ccaaCur=String(__ccaaSess.lastServedModel?.value??__ccaaSess.currentMainLoopModel?.value??"");` +
+    `var __ccaaFam=__ccaaFamOf(__ccaaT.resolvedModel)??__ccaaFamOf(String(__ccaaT.value)+" "+String(__ccaaT.displayName));` +
+    `return!!(__ccaaCur&&__ccaaFam&&__ccaaFamOf(__ccaaCur)!==__ccaaFam)};` +
+    // True when the session runs the slot's model (`shown`, the badge's model) at the slot's
+    // effort — any effort when the slot leaves it alone.
+    `globalThis.__ccaaSlotMatches=(__ccaaSess,__ccaaSlot,__ccaaShown)=>{` +
+    `var __ccaaT=globalThis.__ccaaSlotTarget(__ccaaSess,__ccaaSlot);` +
+    `if(!__ccaaT||!__ccaaShown||__ccaaT.resolvedModel!==__ccaaShown.resolvedModel)return!1;` +
+    `var __ccaaE=globalThis.__ccaaSlotEffort(__ccaaSlot,__ccaaT);` +
+    `return __ccaaE===null||(!__ccaaSess.ultracodeEnabled?.value&&__ccaaSess.effortLevel?.value===__ccaaE)};` +
+    // The slot the session is on, or -1. The last slot applied wins when it still matches, so
+    // two slots with the same model and effort don't trap Ctrl+M on the first one.
+    `globalThis.__ccaaSlotIndex=(__ccaaSess,__ccaaShown)=>{var __ccaaL=globalThis.__ccaaSlots(__ccaaSess);` +
+    `var __ccaaLast=__ccaaL.findIndex((__ccaaS)=>__ccaaS.id===globalThis.__ccaaLastSlotId);` +
+    `if(__ccaaLast!==-1&&globalThis.__ccaaSlotMatches(__ccaaSess,__ccaaL[__ccaaLast],__ccaaShown))return __ccaaLast;` +
+    `return __ccaaL.findIndex((__ccaaS)=>globalThis.__ccaaSlotMatches(__ccaaSess,__ccaaS,__ccaaShown))};` +
+    // Switch the session to the slot's model (session-scoped via the extension.js patch), then
+    // set its effort (session-scoped too). Resolves false when the model is not available.
+    `globalThis.__ccaaApplySlot=(__ccaaSess,__ccaaSlot)=>{` +
+    `var __ccaaT=globalThis.__ccaaSlotTarget(__ccaaSess,__ccaaSlot);if(!__ccaaT)return Promise.resolve(!1);` +
+    `globalThis.__ccaaLastSlotId=__ccaaSlot.id;` +
+    `return Promise.resolve(globalThis.__ccaaNeedsSwitch(__ccaaSess,__ccaaT)?__ccaaSess.setModel(__ccaaT):null)` +
+    `.then(()=>{var __ccaaE=globalThis.__ccaaSlotEffort(__ccaaSlot,__ccaaT);return __ccaaE?__ccaaSess.setEffortLevel(__ccaaE):null})` +
+    `.then(()=>!0)};` +
+    // Apply the slot after the current one, skipping slots whose model is not available.
+    `globalThis.__ccaaCycleSlot=(__ccaaSess,__ccaaShown)=>{var __ccaaL=globalThis.__ccaaSlots(__ccaaSess);` +
+    `var __ccaaN=__ccaaL.length;var __ccaaI=globalThis.__ccaaSlotIndex(__ccaaSess,__ccaaShown);` +
+    `for(var __ccaaK=1;__ccaaK<=__ccaaN;__ccaaK++){var __ccaaS=__ccaaL[(__ccaaI+__ccaaK+__ccaaN)%__ccaaN];` +
+    `if(globalThis.__ccaaSlotTarget(__ccaaSess,__ccaaS))return globalThis.__ccaaApplySlot(__ccaaSess,__ccaaS)}` +
+    `return Promise.resolve(!1)};` +
+    // Apply a slot and submit the composer — what the Ctrl+digit shortcuts do. No-op while
+    // busy or when the composer can't submit (its send button is disabled).
+    `globalThis.__ccaaSendWithSlot=(__ccaaSess,__ccaaId)=>{` +
+    `var __ccaaBtn=document.querySelector('button[type="submit"][data-permission-mode]');` +
+    `if(!__ccaaBtn||__ccaaBtn.disabled||__ccaaSess.busy.value)return;` +
+    `var __ccaaSlot=globalThis.__ccaaSlots(__ccaaSess).find((__ccaaS)=>__ccaaS.id===__ccaaId);` +
+    `if(!__ccaaSlot)return;var __ccaaForm=__ccaaBtn.form;` +
+    `globalThis.__ccaaApplySlot(__ccaaSess,__ccaaSlot).then((__ccaaOk)=>{if(__ccaaOk&&__ccaaForm)__ccaaForm.requestSubmit()})};` +
+    `}catch(__ccaaLibErr){}})();/*__ccaaQuickSendLibEnd*/\n`;
+  return { ok: true, content: lib + content };
+}
+
 const MODEL_UI_SENTINEL_RE = /;\/\*__ccaaModelUi\*\/[\s\S]*?\/\*__ccaaModelUiEnd\*\//g;
 
 // Inside the reactive effect that registers the "Switch model…" command action, append:
-// - a per-session model badge (fixed top-right of the webview, click opens the picker,
-//   warning colors when the session is on a Fable model). When the current model supports
-//   effort, the badge also shows the current effort level ("Model · xhigh", or "· ultra"
-//   under ultracode); it stays live because reading the effort signals re-runs this effect.
-// - two effort helpers: __ccaaEffortFor(model) maps a model family to its preferred effort
-//   (Opus->xhigh, Sonnet/Haiku->medium) when the model supports it, else null;
-//   __ccaaApplyEffort(session,model) sets that effort (session-scoped via the extension.js
-//   patch). Both are used by every model-switch action below so switching model also bumps
-//   effort to match the family.
-// - a Ctrl+M keydown handler (capture phase) that cycles through available models for
-//   the session rendered in this webview (and applies the family's effort). Alias entries
-//   (older spellings, present since 2.1.261) are skipped; __ccaaPickable orders the real
-//   models first so the family lookups below and in the quick-send buttons prefer them.
-// - Ctrl+0 / Ctrl+1 / Ctrl+2 / Ctrl+3 keydown handlers (same listener) that switch the
-//   session to Fable / Opus / Sonnet / Haiku and submit the composer in one go — the
-//   keyboard equivalent of the quick-send buttons (Opus has no button).
+// - a per-session model badge (fixed top-right of the webview). When the current model
+//   supports effort, the badge also shows the current effort level ("Model · xhigh", or
+//   "· ultra" under ultracode); it stays live because reading the effort signals re-runs this
+//   effect. It takes the color of the quick-send slot the session is on, else the model
+//   family's color. Clicking it applies the next slot (the model picker when the slot helpers
+//   are missing).
+// - a Ctrl+M keydown handler (capture phase) that applies the next quick-send slot to the
+//   session rendered in this webview.
+// - Ctrl+0 / Ctrl+1 / Ctrl+2 / Ctrl+3 keydown handlers (same listener) that apply that
+//   slot and submit the composer in one go — the keyboard equivalent of the quick-send
+//   buttons (the Ctrl+1 slot has no button).
 function injectModelUi(content, { contextOnByDefault = false } = {}) {
   // Match both the pre-2.1.177 inline label computation and the 2.1.177+ form, where it was
   // extracted into a helper (…,ze=GCe(q,t.lastServedModel.value,Te);n.commandRegistry.registerAction…).
@@ -234,7 +325,7 @@ function injectModelUi(content, { contextOnByDefault = false } = {}) {
     `var __ccaaSpan=document.createElement("span");__ccaaSpan.id="ccaa-model-badge-main";` +
     `__ccaaSpan.style.cssText="padding:1px 8px;border-radius:9px";__ccaaBadge.appendChild(__ccaaSpan);` +
     `document.body.appendChild(__ccaaBadge)}` +
-    `__ccaaBadge.onclick=()=>${openPickerVar}(!0);` +
+    `__ccaaBadge.onclick=()=>globalThis.__ccaaCycleSlot?globalThis.__ccaaCycleSlot(${sessionVar},globalThis.__ccaaBadgeShown):${openPickerVar}(!0);` +
     `var __ccaaMainEl=document.getElementById("ccaa-model-badge-main");` +
     `var __ccaaModels=${sessionVar}.claudeConfig.value?.models??[];` +
     `var __ccaaSelected=${sessionVar}.modelSelection.value??"default";` +
@@ -256,6 +347,8 @@ function injectModelUi(content, { contextOnByDefault = false } = {}) {
     `var __ccaaDrift=!!(__ccaaSelFam&&__ccaaServedFam&&__ccaaSelFam!==__ccaaServedFam);` +
     `var __ccaaServedModel=__ccaaModels.find((__ccaaM)=>__ccaaM.resolvedModel===__ccaaServed)??__ccaaModels.find((__ccaaM)=>__ccaaM.value===__ccaaServedFam);` +
     `var __ccaaShownModel=__ccaaDrift?__ccaaServedModel:__ccaaSelModel;` +
+    // The key handler is bound once per webview, so it reaches the session through these.
+    `globalThis.__ccaaSession=${sessionVar};globalThis.__ccaaBadgeShown=__ccaaShownModel;` +
     `var __ccaaLabel=__ccaaDrift?(__ccaaServedModel?.displayName??__ccaaServedFam):(${nameVar}??__ccaaSelModel?.displayName??__ccaaSelected);` +
     `var __ccaaSelLabel=__ccaaSelModel?.displayName??__ccaaSelected;` +
     // Append the current effort to the badge when the shown model supports it (reading these
@@ -265,28 +358,16 @@ function injectModelUi(content, { contextOnByDefault = false } = {}) {
     `var __ccaaEffort=(__ccaaSupportsEffort&&${sessionVar}.effortLevel?.value)?String(${sessionVar}.effortLevel.value):"";` +
     `if(__ccaaEffort&&${sessionVar}.ultracodeEnabled?.value)__ccaaEffort="ultra";` +
     `var __ccaaColorOf=(__ccaaF)=>__ccaaF==="fable"?"#8052d2":__ccaaF==="opus"?"#c63e3e":__ccaaF==="sonnet"?"#bc8e26":__ccaaF==="haiku"?"#269473":null;` +
-    `var __ccaaColor=__ccaaColorOf(__ccaaServedFam??__ccaaSelFam??__ccaaFamOf(__ccaaRunning));` +
+    `var __ccaaSlotIdx=globalThis.__ccaaSlotIndex?.(${sessionVar},__ccaaShownModel)??-1;` +
+    `var __ccaaSlotNow=__ccaaSlotIdx>=0?globalThis.__ccaaSlots(${sessionVar})[__ccaaSlotIdx]:null;` +
+    `var __ccaaColor=__ccaaSlotNow?__ccaaSlotNow.color:__ccaaColorOf(__ccaaServedFam??__ccaaSelFam??__ccaaFamOf(__ccaaRunning));` +
     `__ccaaMainEl.style.background=__ccaaColor??"var(--vscode-badge-background,#4d4d4d)";` +
     `__ccaaMainEl.style.color=__ccaaColor?"#fff":"var(--vscode-badge-foreground,#fff)";` +
     `__ccaaMainEl.textContent=__ccaaEffort?String(__ccaaLabel)+" \xB7 "+__ccaaEffort:String(__ccaaLabel);` +
     `__ccaaBadge.title=(__ccaaEffort?"Claude model + effort ("+String(__ccaaLabel)+" \xB7 "+__ccaaEffort+")":"Claude model ("+String(__ccaaLabel)+")")` +
     `+(__ccaaDrift?" — the picker shows "+String(__ccaaSelLabel)+", your default, which was never applied to this session":"")` +
-    `+" (click to switch, Ctrl+M to cycle)";` +
-    // Map a model to the effort we want for its family (Fable->high, Opus->xhigh,
-    // Sonnet/Haiku->medium), but only if the model reports it supports that level — else
-    // null (leave effort as-is).
-    `globalThis.__ccaaEffortFor=(__ccaaM)=>{` +
-    `if(!__ccaaM||!__ccaaM.supportsEffort)return null;` +
-    `var __ccaaS=(String(__ccaaM.value??"")+" "+String(__ccaaM.displayName??"")).toLowerCase();` +
-    `var __ccaaWant=/fable/.test(__ccaaS)?"high":/opus/.test(__ccaaS)?"xhigh":/sonnet/.test(__ccaaS)?"medium":/haiku/.test(__ccaaS)?"medium":null;` +
-    `if(!__ccaaWant)return null;var __ccaaLv=__ccaaM.supportedEffortLevels;` +
-    `return(!__ccaaLv||__ccaaLv.includes(__ccaaWant))?__ccaaWant:null};` +
-    // Set the family's effort for the given session. setEffortLevel no-ops internally when the
-    // level already matches, and the extension.js patch keeps the write session-scoped.
-    `globalThis.__ccaaApplyEffort=(__ccaaSess,__ccaaM)=>{` +
-    `try{var __ccaaW=globalThis.__ccaaEffortFor(__ccaaM);` +
-    `if(__ccaaW)return Promise.resolve(__ccaaSess.setEffortLevel(__ccaaW))}catch(__ccaaEfE){}` +
-    `return Promise.resolve()};` +
+    `+(__ccaaSlotNow?" — "+__ccaaSlotNow.id+" slot [Ctrl + "+__ccaaSlotNow.key+"]":"")` +
+    `+" (click or Ctrl+M for the next slot)";` +
     // Instant custom tooltip for the quick-send buttons (the native `title` attribute has a
     // ~1s hover delay). A single reused #ccaa-tip node is positioned above the hovered
     // element, flipped below and clamped horizontally when it would leave the viewport. All
@@ -304,44 +385,6 @@ function injectModelUi(content, { contextOnByDefault = false } = {}) {
     `__ccaaTip.style.left=__ccaaCx+"px";__ccaaTip.style.top=(__ccaaTop<4?__ccaaR.bottom+6:__ccaaTop)+"px";` +
     `__ccaaTip.style.transform="translateX(-50%)"}catch(__ccaaTe){}};` +
     `globalThis.__ccaaHideTip=()=>{try{var __ccaaTip=document.getElementById("ccaa-tip");if(__ccaaTip)__ccaaTip.style.display="none"}catch(__ccaaTe){}};` +
-    // Since 2.1.261 the model list also carries alias entries (older spellings of a model,
-    // flagged by "alias" in their name/description — the same test upstream's picker uses to
-    // list them last). Order the real models first so a family lookup lands on the current
-    // spelling, and leave the aliases out of the cycle unless they are all there is.
-    `globalThis.__ccaaIsAlias=(__ccaaM)=>/\\balias(?:es)?\\b/i.test(String(__ccaaM.displayName??"")+" "+String(__ccaaM.description??""));` +
-    `globalThis.__ccaaPickable=(__ccaaL)=>__ccaaL.filter((__ccaaM)=>!globalThis.__ccaaIsAlias(__ccaaM)).concat(__ccaaL.filter(globalThis.__ccaaIsAlias));` +
-    `globalThis.__ccaaCycleModel=()=>{` +
-    `var __ccaaAll=${sessionVar}.claudeConfig.value?.models??[];` +
-    `var __ccaaList=__ccaaAll.filter((__ccaaM)=>!globalThis.__ccaaIsAlias(__ccaaM));` +
-    `if(__ccaaList.length<2)__ccaaList=__ccaaAll;if(__ccaaList.length<2)return;` +
-    `var __ccaaCurrent=${sessionVar}.modelSelection.value??"default";` +
-    `var __ccaaIndex=__ccaaList.findIndex((__ccaaM)=>__ccaaM.value===__ccaaCurrent);` +
-    `var __ccaaNext=__ccaaList[(__ccaaIndex+1)%__ccaaList.length];` +
-    `Promise.resolve(${sessionVar}.setModel(__ccaaNext)).then(()=>globalThis.__ccaaApplyEffort(${sessionVar},__ccaaNext))};` +
-    // True when the session must be told to switch to the target model. modelSelection alone
-    // can't answer that: it is seeded from the *global* default model setting on launch, which
-    // the session-scoped setModel patch never writes — so a resumed session reads
-    // "opus[1m]" while the CLI is really serving Fable. Treat a served model outside the
-    // requested family as drift and switch anyway; without it a send would keep the old model
-    // yet still apply the target's effort (e.g. Fable answering at Opus' xhigh).
-    `var __ccaaNeedsSwitch=(__ccaaSess,__ccaaT,__ccaaRe)=>{` +
-    `if(__ccaaSess.modelSelection.value!==__ccaaT.value)return!0;` +
-    `var __ccaaCur=String(__ccaaSess.lastServedModel?.value??__ccaaSess.currentMainLoopModel?.value??"");` +
-    `return __ccaaCur?!__ccaaRe.test(__ccaaCur):!1};` +
-    `globalThis.__ccaaNeedsSwitch=__ccaaNeedsSwitch;` +
-    // Switch the session to the first model whose value/displayName matches the regex, then
-    // submit the composer — the keyboard equivalent of the quick-send buttons (Ctrl+0 Fable,
-    // Ctrl+1 Opus, Ctrl+2 Sonnet, Ctrl+3 Haiku). No-op while busy, when the composer can't
-    // submit (its send button is disabled), or when no model matches (e.g. unavailable).
-    `globalThis.__ccaaSendWithModel=(__ccaaRe)=>{` +
-    `var __ccaaBtn=document.querySelector('button[type="submit"][data-permission-mode]');` +
-    `if(!__ccaaBtn||__ccaaBtn.disabled||${sessionVar}.busy.value)return;` +
-    `var __ccaaList=globalThis.__ccaaPickable(${sessionVar}.claudeConfig.value?.models??[]);` +
-    `var __ccaaTarget=__ccaaList.find((__ccaaM)=>__ccaaRe.test(__ccaaM.value)||__ccaaRe.test(__ccaaM.displayName));` +
-    `if(!__ccaaTarget)return;var __ccaaForm=__ccaaBtn.form;` +
-    `Promise.resolve(__ccaaNeedsSwitch(${sessionVar},__ccaaTarget,__ccaaRe)?${sessionVar}.setModel(__ccaaTarget):null)` +
-    `.then(()=>globalThis.__ccaaApplyEffort(${sessionVar},__ccaaTarget))` +
-    `.then(()=>{if(__ccaaForm)__ccaaForm.requestSubmit()})};` +
     // Attach/detach the current file/selection: flip the global the composer's send-time
     // include flag reads, and mirror it onto <body> so the CSS patch can dim the file chip
     // while context is off (the chip itself stays — it is what shows which file is current,
@@ -361,28 +404,26 @@ function injectModelUi(content, { contextOnByDefault = false } = {}) {
     `if(!globalThis.__ccaaModelKeyBound){globalThis.__ccaaModelKeyBound=!0;` +
     `window.addEventListener("keydown",(__ccaaE)=>{` +
     `if(!(__ccaaE.ctrlKey&&!__ccaaE.metaKey&&!__ccaaE.altKey&&!__ccaaE.shiftKey))return;` +
-    `if(__ccaaE.key==="m"||__ccaaE.key==="M"){__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaCycleModel?.()}` +
-    `else if(__ccaaE.key==="1"){__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaSendWithModel?.(/opus/i)}` +
-    `else if(__ccaaE.key==="2"){__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaSendWithModel?.(/sonnet/i)}` +
-    `else if(__ccaaE.key==="3"){__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaSendWithModel?.(/haiku/i)}` +
-    `else if(__ccaaE.key==="0"){__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaSendWithModel?.(/fable/i)}` +
+    `var __ccaaSess=globalThis.__ccaaSession;` +
+    `if(__ccaaE.key==="m"||__ccaaE.key==="M"){__ccaaE.preventDefault();__ccaaE.stopPropagation();if(__ccaaSess)globalThis.__ccaaCycleSlot?.(__ccaaSess,globalThis.__ccaaBadgeShown)}` +
     `else if(__ccaaE.key==="f"||__ccaaE.key==="F"){__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaToggleContext?.()}` +
+    `else{var __ccaaKeySlot=__ccaaSess&&/^[0-9]$/.test(__ccaaE.key)?globalThis.__ccaaSlots?.(__ccaaSess)?.find((__ccaaS)=>__ccaaS.key===__ccaaE.key):null;` +
+    `if(__ccaaKeySlot){__ccaaE.preventDefault();__ccaaE.stopPropagation();globalThis.__ccaaSendWithSlot?.(__ccaaSess,__ccaaKeySlot.id)}}` +
     `},!0)}` +
     `}catch(__ccaaErr2){}/*__ccaaModelUiEnd*/`;
 
-  return { ok: true, content: content.replace(anchor, anchor + insertion) };
+  return { ok: true, content: content.replace(anchor, () => anchor + insertion) };
 }
 
 const SEND_MODEL_BUTTONS_SENTINEL_RE = /\/\*__ccaaSendBtns\*\/[\s\S]*?\/\*__ccaaSendBtnsEnd\*\//g;
 
-// Add three extra send buttons next to the composer's send button — switching the session
-// to Sonnet, Haiku, or Fable — then submit the prompt. They reuse the session's setModel
-// (session-scoped via the extension.js patch), skip it only when __ccaaNeedsSwitch (defined by
-// injectModelUi) says the session already runs that model, bump the effort to match the model
-// family via __ccaaApplyEffort, and the form's native submit path, so the
-// only new behavior is "switch model + effort on the fly, then send". Each button hides itself
-// when its model isn't available for the session. The original send button (and its send/stop
-// animation) is left untouched; the new ones sit to its right as plain shortcuts.
+// Add three extra send buttons next to the composer's send button — the yellow, teal and
+// purple quick-send slots — that apply their slot (model + effort, both session-scoped, via
+// __ccaaApplySlot from injectQuickSendLib) and then submit through the form's native path.
+// The slot is read on every render, so a settings change shows up on the next one. Each
+// button hides itself when its slot's model isn't available for the session (or when the
+// slot helpers are missing). The original send button (and its send/stop animation) is left
+// untouched; the new ones sit to its right as plain shortcuts.
 function injectSendModelButtons(content) {
   // Two JSX-call shapes must be matched: the classic `X.createElement("button",{…},ICON)`
   // (positional child) and the newer runtime `b("button",{…,children:ICON})` (child as a
@@ -406,38 +447,33 @@ function injectSendModelButtons(content) {
   // (`,children:X})`) or positional (`},X)`), so the injected buttons stay valid JSX calls.
   const close = childAsProp ? `,children:${child}})` : `},${child})`;
 
-  // shortcut is the Ctrl chord shown in the tooltip (e.g. "Ctrl + 2"), matching the
-  // keyboard handler injected by injectModelUi. The tooltip text also appends the effort the
-  // button will apply (via __ccaaEffortFor), so it reads "Send to Sonnet · medium [Ctrl + 2]".
-  // It's shown via the instant custom tooltip (__ccaaShowTip/__ccaaHideTip from injectModelUi,
-  // called with ?. so the button still works if that patch skips) to avoid the native
-  // `title` hover delay; the same text stays on `aria-label` for screen readers.
-  const button = (modelRe, background, color, shortcut) =>
+  // The tooltip reads e.g. "Send to Sonnet · medium [Ctrl + 2]": the slot's model, the effort
+  // it will set (none when it leaves effort alone), and the matching shortcut from
+  // injectModelUi. It's shown via the instant custom tooltip (__ccaaShowTip/__ccaaHideTip from
+  // injectModelUi, called with ?. so the button still works if that patch skips) to avoid the
+  // native `title` hover delay; the same text stays on `aria-label` for screen readers.
+  const button = (slot) =>
     `(()=>{` +
-    `var __ccaaModels=${sess}.claudeConfig.value?.models??[];` +
-    `__ccaaModels=globalThis.__ccaaPickable?.(__ccaaModels)??__ccaaModels;` +
-    `var __ccaaTarget=__ccaaModels.find((__ccaaM)=>${modelRe}.test(__ccaaM.value)||${modelRe}.test(__ccaaM.displayName));` +
+    `var __ccaaSlot=globalThis.__ccaaSlots?.(${sess})?.find((__ccaaS)=>__ccaaS.id===${JSON.stringify(slot.id)});` +
+    `var __ccaaTarget=__ccaaSlot?globalThis.__ccaaSlotTarget(${sess},__ccaaSlot):null;` +
     `if(!__ccaaTarget)return null;` +
     `var __ccaaDisabled=${sess}.busy.value||!${canSubmit};` +
-    `var __ccaaEff=globalThis.__ccaaEffortFor?.(__ccaaTarget);` +
-    `var __ccaaTip="Send to "+__ccaaTarget.displayName+(__ccaaEff?" · "+__ccaaEff:"")+" [${shortcut}]";` +
+    `var __ccaaEff=globalThis.__ccaaSlotEffort(__ccaaSlot,__ccaaTarget);` +
+    `var __ccaaTip="Send to "+__ccaaTarget.displayName+(__ccaaEff?" · "+__ccaaEff:"")+" [Ctrl + ${slot.key}]";` +
     `return ${factory}("button",{type:"button",className:${clsObj}.sendButton,` +
+    `"data-ccaa-slot":${JSON.stringify(slot.id)},` +
     `disabled:__ccaaDisabled,` +
     `"aria-label":__ccaaTip,` +
     `onMouseEnter:(__ccaaEv)=>globalThis.__ccaaShowTip?.(__ccaaEv.currentTarget,__ccaaTip),` +
     `onMouseLeave:()=>globalThis.__ccaaHideTip?.(),` +
-    `style:{background:${JSON.stringify(background)},color:${JSON.stringify(color)},opacity:__ccaaDisabled?.45:1},` +
+    `style:{background:${JSON.stringify(slot.color)},color:"#ffffff",opacity:__ccaaDisabled?.45:1},` +
     `onClick:(__ccaaEv)=>{__ccaaEv.preventDefault();globalThis.__ccaaHideTip?.();` +
     `var __ccaaForm=__ccaaEv.currentTarget.closest("form");` +
-    `Promise.resolve((globalThis.__ccaaNeedsSwitch?globalThis.__ccaaNeedsSwitch(${sess},__ccaaTarget,${modelRe}):${sess}.modelSelection.value!==__ccaaTarget.value)?${sess}.setModel(__ccaaTarget):null)` +
-    `.then(()=>globalThis.__ccaaApplyEffort?.(${sess},__ccaaTarget))` +
-    `.then(()=>{if(__ccaaForm)__ccaaForm.requestSubmit()})}` +
+    `globalThis.__ccaaApplySlot(${sess},__ccaaSlot).then((__ccaaOk)=>{if(__ccaaOk&&__ccaaForm)__ccaaForm.requestSubmit()})}` +
     `${close}})()`;
 
-  const sonnet = button('/sonnet/i', '#bc8e26', '#ffffff', 'Ctrl + 2');
-  const haiku = button('/haiku/i', '#269473', '#ffffff', 'Ctrl + 3');
-  const fable = button('/fable/i', '#8052d2', '#ffffff', 'Ctrl + 0');
-  const insertion = `/*__ccaaSendBtns*/,${sonnet},${haiku},${fable}/*__ccaaSendBtnsEnd*/`;
+  const buttons = ['yellow', 'teal', 'purple'].map((id) => button(QUICK_SEND_SLOTS.find((slot) => slot.id === id)));
+  const insertion = `/*__ccaaSendBtns*/,${buttons.join(',')}/*__ccaaSendBtnsEnd*/`;
 
   return { ok: true, content: content.replace(anchor, () => anchor + insertion) };
 }
@@ -923,6 +959,46 @@ function injectSessionScopedEffort(content) {
   return { ok: true, content: replaceMatch(content, matches[0], insertion + anchor) };
 }
 
+const QUICK_SEND_STATE_SENTINEL_RE = /\/\*__ccaaQuickSendState\*\/[\s\S]*?\/\*__ccaaQuickSendStateEnd\*\//g;
+
+// The webview can't read VS Code settings, so the host hands the quickSend.<slot>.* settings
+// over in the state it posts to the webview, next to spinnerVerbsConfig (a setting upstream
+// forwards the same way). The value is read each time the state is built. Every builder
+// gets it — the init and update payloads are built separately, and a webview whose state
+// lacked it would drop back to the default slots until the next push.
+function injectQuickSendState(content) {
+  const anchorRe = /spinnerVerbsConfig:this\.settings\.getSpinnerVerbsConfig\(\),/g;
+  const count = [...content.matchAll(anchorRe)].length;
+  if (count === 0) {
+    return { ok: false, reason: 'webview state builder not found (Claude Code internals may have changed)' };
+  }
+  const insertion =
+    `/*__ccaaQuickSendState*/ccaaQuickSend:(()=>{try{` +
+    `return require("vscode").workspace.getConfiguration("claude-code-no-auto-attach").get("quickSend")` +
+    `}catch(__ccaaQsErr){}})(),/*__ccaaQuickSendStateEnd*/`;
+  return { ok: true, content: content.replace(anchorRe, (anchor) => anchor + insertion) };
+}
+
+const QUICK_SEND_WATCH_SENTINEL_RE = /\/\*__ccaaQuickSendWatch\*\/[\s\S]*?\/\*__ccaaQuickSendWatchEnd\*\//g;
+
+// Upstream re-posts the webview state when one of a few claudeCode.* settings changes. Add
+// the quickSend settings to that list, so a change reaches open sessions right away instead
+// of on the next unrelated state push.
+function injectQuickSendWatch(content) {
+  const anchorRe = /([\w$]+)\.affectsConfiguration\("claudeCode\.spinnerVerbs"\)(?=\)this\.pushStateUpdate\(\))/g;
+  const matches = [...content.matchAll(anchorRe)];
+  if (matches.length === 0) {
+    return { ok: false, reason: 'state-push settings listener not found (Claude Code internals may have changed)' };
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${matches.length} state-push settings listeners found` };
+  }
+  const [anchor, eventVar] = matches[0];
+  const insertion =
+    `/*__ccaaQuickSendWatch*/||${eventVar}.affectsConfiguration("claude-code-no-auto-attach.quickSend")/*__ccaaQuickSendWatchEnd*/`;
+  return { ok: true, content: replaceMatch(content, matches[0], anchor + insertion) };
+}
+
 const MD_PREVIEW_SENTINEL_RE = /\/\*__ccaaMdPreview\*\/[\s\S]*?\/\*__ccaaMdPreviewEnd\*\//g;
 const MD_PREVIEW2_SENTINEL_RE = /\/\*__ccaaMdPreview2\*\/[\s\S]*?\/\*__ccaaMdPreview2End\*\//g;
 const MD_PREVIEW3_SENTINEL_RE = /\/\*__ccaaMdPreview3\*\/[\s\S]*?\/\*__ccaaMdPreview3End\*\//g;
@@ -1144,7 +1220,9 @@ function computeWebviewPatch(content, { detachContextByDefault = true } = {}) {
     { name: 'session-mount-focus', inject: injectSessionMountFocus },
     { name: 'question-keeps-focus', inject: injectAskQuestionFocus },
     { name: 'question-notes-input', inject: injectAskQuestionNotes },
-    { name: 'question-no-auto-advance', inject: injectNoQuestionAutoAdvance }
+    { name: 'question-no-auto-advance', inject: injectNoQuestionAutoAdvance },
+    // Last, so its code can't add a second match to any anchor above.
+    { name: 'quick-send-lib', inject: injectQuickSendLib }
   );
   return runSubPatches(content, subPatches);
 }
@@ -1153,7 +1231,8 @@ function revertWebviewPatch(content) {
   const stripped = stripMarker(content);
   if (stripped === null) return { reverted: false, reason: 'not patched' };
 
-  let next = revertLegacySelectionPatches(stripped);
+  let next = stripped.replace(QUICK_SEND_LIB_SENTINEL_RE, '');
+  next = revertLegacySelectionPatches(next);
   next = revertContextSendFlag(next);
   next = revertHideRateLimitWarning(next);
   next = revertSessionMountFocus(next);
@@ -1233,6 +1312,8 @@ function computeExtensionPatch(content) {
     { name: 'uri-open-in-editor', inject: injectUriOpenInEditor },
     { name: 'system-prompt-trim', inject: injectSystemPromptTrim },
     { name: 'close-panel-api', inject: injectClosePanelApi },
+    { name: 'quick-send-state', inject: injectQuickSendState },
+    { name: 'quick-send-watch', inject: injectQuickSendWatch },
   ]);
 }
 
@@ -1250,6 +1331,8 @@ function revertExtensionPatch(content) {
   next = next.replace(URI_OPEN_EXT_SENTINEL_RE, '');
   next = revertSystemPromptTrim(next);
   next = next.replace(CLOSE_API_SENTINEL_RE, '');
+  next = next.replace(QUICK_SEND_STATE_SENTINEL_RE, '');
+  next = next.replace(QUICK_SEND_WATCH_SENTINEL_RE, '');
   return { reverted: true, content: next };
 }
 
@@ -1257,7 +1340,7 @@ const PATCH_SITES = [
   {
     relativePath: ['webview', 'index.js'],
     description:
-      'context detached by default + per-session model badge + Ctrl+M model cycle + Ctrl+F context toggle + hide rate-limit warnings + uri-open panel listener + questions keep your focus',
+      'context detached by default + per-session model badge + quick-send slots (buttons, Ctrl+0-3, Ctrl+M) + Ctrl+F context toggle + hide rate-limit warnings + uri-open panel listener + questions keep your focus',
     compute: computeWebviewPatch,
     revert: revertWebviewPatch,
     syntaxCheck: true,
@@ -1270,7 +1353,7 @@ const PATCH_SITES = [
   },
   {
     relativePath: ['extension.js'],
-    description: 'auto-allow gitignored Write/Edit prompts (bypass mode only) + capture permission mode + session-scoped model + session-scoped effort switch + uri /open in the Claude editor group + trimmed appended system prompt',
+    description: 'auto-allow gitignored Write/Edit prompts (bypass mode only) + capture permission mode + session-scoped model + session-scoped effort switch + uri /open in the Claude editor group + trimmed appended system prompt + quick-send settings in the webview state',
     compute: computeExtensionPatch,
     revert: revertExtensionPatch,
     syntaxCheck: true,
@@ -1549,6 +1632,7 @@ module.exports = {
   activate,
   deactivate,
   // exported for tests
+  QUICK_SEND_SLOTS,
   computeWebviewPatch,
   revertWebviewPatch,
   computePromptHeightPatch,

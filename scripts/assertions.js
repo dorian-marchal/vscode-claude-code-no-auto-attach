@@ -17,6 +17,8 @@
 // minifier uses a bare `$` as a variable name. Any replace() whose replacement embeds a
 // captured name must use the function form.
 
+const pkg = require('../package.json');
+
 // --- small helpers ---
 
 const need = (content, parts) => {
@@ -131,20 +133,60 @@ const WEBVIEW = [
     },
   },
   {
+    // Ctrl+M and a badge click apply the next slot; Ctrl+digit applies the slot bound to that
+    // digit and sends. The badge takes the color of the slot the session is on.
     name: 'model-badge-and-shortcut',
     rel: 'webview/index.js',
-    check: (patched) =>
-      need(patched, [
+    check(patched) {
+      const injected = block(patched, 'ModelUi');
+      if (!injected) return 'no /*__ccaaModelUi*/ block';
+      return need(injected, [
         ['the badge element', 'ccaa-model-badge-main'],
+        ['the badge click applying the next slot', '__ccaaBadge.onclick=()=>globalThis.__ccaaCycleSlot?globalThis.__ccaaCycleSlot('],
+        ['the badge color from the current slot', '__ccaaColor=__ccaaSlotNow?__ccaaSlotNow.color:'],
         ['the Ctrl+M binding', '__ccaaE.key==="m"||__ccaaE.key==="M"'],
-        ['the Ctrl+0 binding', '__ccaaE.key==="0"'],
-        ['the Ctrl+1 binding', '__ccaaE.key==="1"'],
-        ['the Ctrl+2 binding', '__ccaaE.key==="2"'],
-        ['the Ctrl+3 binding', '__ccaaE.key==="3"'],
+        ['Ctrl+M applying the next slot', 'globalThis.__ccaaCycleSlot?.(__ccaaSess,'],
+        ['the Ctrl+digit lookup by slot key', '__ccaaS.key===__ccaaE.key'],
+        ['Ctrl+digit applying the slot and sending', 'globalThis.__ccaaSendWithSlot?.(__ccaaSess,__ccaaKeySlot.id)'],
+      ]);
+    },
+  },
+  {
+    // Every slot is read from the quickSend.* settings (defaults matching package.json), set
+    // with setModel + setEffortLevel, and bound to one of Ctrl+0..3.
+    name: 'quick-send-lib',
+    rel: 'webview/index.js',
+    check(patched) {
+      if (!/^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n\/\*__ccaaQuickSendLib\*\//.test(patched)) {
+        return 'the slot helpers do not open the bundle, right after the marker';
+      }
+      const injected = block(patched, 'QuickSendLib');
+      const problem = need(injected, [
+        ['the settings read from the webview state', '.config?.value?.ccaaQuickSend'],
+        ['the model switch', '.setModel(__ccaaT)'],
+        ['the effort set', '.setEffortLevel(__ccaaE)'],
+        ['the "unchanged" effort', '__ccaaE==="unchanged"'],
+        ['the unsupported-level guard', '__ccaaLv.includes(__ccaaE)'],
         ['__ccaaNeedsSwitch', 'globalThis.__ccaaNeedsSwitch='],
-        ['__ccaaEffortFor', 'globalThis.__ccaaEffortFor='],
-        ['__ccaaApplyEffort', 'globalThis.__ccaaApplyEffort='],
-      ]),
+        ['the composer submit', '__ccaaForm.requestSubmit()'],
+      ]);
+      if (problem) return problem;
+      const defaults = JSON.parse(injected.match(/var __ccaaDefaults=(\[.*?\]);/)[1]);
+      const keys = defaults.map((slot) => slot.key).join('');
+      if (keys !== '0123') return `slot shortcuts are Ctrl+${keys.split('').join('/')}, expected Ctrl+0/1/2/3`;
+      const settings = pkg.contributes.configuration.properties;
+      for (const slot of defaults) {
+        for (const field of ['model', 'effort']) {
+          const setting = settings[`claude-code-no-auto-attach.quickSend.${slot.id}.${field}`];
+          if (!setting) return `no quickSend.${slot.id}.${field} setting in package.json`;
+          if (setting.default !== slot[field]) {
+            return `quickSend.${slot.id}.${field} defaults to ${setting.default} in package.json but ${slot[field]} in the patch`;
+          }
+          if (!setting.enum.includes(slot[field])) return `quickSend.${slot.id}.${field} default is not in its enum`;
+        }
+      }
+      return null;
+    },
   },
   {
     name: 'send-model-buttons',
@@ -155,13 +197,17 @@ const WEBVIEW = [
       const count = (injected.match(/type:"button"/g) || []).length;
       if (count !== 3) return `expected 3 injected send buttons, found ${count}`;
       const missing = [
-        ['Sonnet', '/sonnet/i', '#bc8e26'],
-        ['Haiku', '/haiku/i', '#269473'],
-        ['Fable', '/fable/i', '#8052d2'],
+        ['yellow', '#bc8e26'],
+        ['teal', '#269473'],
+        ['purple', '#8052d2'],
       ]
-        .filter(([, modelRe, color]) => !injected.includes(modelRe) || !injected.includes(color))
-        .map(([label]) => label);
-      return missing.length ? `send buttons missing their model regex or colour: ${missing.join(', ')}` : null;
+        .filter(([id, color]) => !injected.includes(`"data-ccaa-slot":"${id}"`) || !injected.includes(color))
+        .map(([id]) => id);
+      if (missing.length) return `send buttons missing their slot or colour: ${missing.join(', ')}`;
+      return need(injected, [
+        ['the slot applied on click', 'globalThis.__ccaaApplySlot('],
+        ['the slot effort in the tooltip', 'globalThis.__ccaaSlotEffort('],
+      ]);
     },
   },
   {
@@ -253,6 +299,8 @@ const WEBVIEW = [
         ['the model picker action', 'Switch model…'],
         ['the panel bootstrap', 'listSessions("panel_boot")'],
         ['the session selection writer', 'applySelectionUpdate'],
+        ['a setting read off the webview state', '.config.value?.spinnerVerbsConfig'],
+        ['the session effort setter', 'setEffortLevel('],
       ]),
   },
   {
@@ -490,6 +538,30 @@ const EXTENSION = [
     },
   },
   {
+    // Every webview state the host builds carries the quickSend settings, read when it is built.
+    name: 'quick-send-state',
+    rel: 'extension.js',
+    check(patched, clean) {
+      const anchor = 'spinnerVerbsConfig:this.settings.getSpinnerVerbsConfig(),';
+      const builders = windows(clean, anchor, 0, 0).length;
+      const read =
+        '/*__ccaaQuickSendState*/ccaaQuickSend:(()=>{try{return require("vscode").workspace.getConfiguration("claude-code-no-auto-attach").get("quickSend")';
+      const carried = windows(patched, anchor + read, 0, 0).length;
+      return carried === builders ? null : `${carried} of ${builders} webview state builders carry the quickSend settings`;
+    },
+  },
+  {
+    // A quickSend settings change re-posts the state, like upstream's own forwarded settings.
+    name: 'quick-send-watch',
+    rel: 'extension.js',
+    check: (patched) =>
+      /\.affectsConfiguration\("claudeCode\.spinnerVerbs"\)\/\*__ccaaQuickSendWatch\*\/\|\|[\w$]+\.affectsConfiguration\("claude-code-no-auto-attach\.quickSend"\)\/\*__ccaaQuickSendWatchEnd\*\/\)this\.pushStateUpdate\(\)/.test(
+        patched
+      )
+        ? null
+        : 'the quickSend settings are not in the listener that re-posts the webview state',
+  },
+  {
     name: 'upstream-affordances',
     rel: 'extension.js',
     check: (_patched, clean) =>
@@ -503,6 +575,8 @@ const EXTENSION = [
         ['the active-editor subscription', 'onDidChangeActiveTextEditor'],
         ['the appended VSCode prompt', '# VSCode Extension Context'],
         ['the workspace-relative link rule', 'The URL links should be relative paths'],
+        ['the webview state builder', 'spinnerVerbsConfig:this.settings.getSpinnerVerbsConfig(),'],
+        ['the state-push settings listener', 'affectsConfiguration("claudeCode.spinnerVerbs"))this.pushStateUpdate()'],
       ]),
   },
 ];

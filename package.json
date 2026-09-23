@@ -1,8 +1,8 @@
 {
   "name": "claude-code-no-auto-attach",
   "displayName": "Claude Code: No Auto-Attach",
-  "description": "Patches the Claude Code VS Code extension: auto-attach defaults to OFF (configurable), Ctrl+F context-attach toggle, session-scoped model switching, session-scoped effort switching, per-model effort presets (Fable high / Opus xhigh / Sonnet+Haiku medium), per-session model badge, Ctrl+M model cycling, Ctrl+0/1/2/3 send-with-Fable/Opus/Sonnet/Haiku shortcuts, Sonnet/Haiku/Fable quick-send buttons, capped/scrollable prompt bubbles, markdown-preview context attach, vscode://…/open URIs open in the locked Claude editor group and auto-send their prompt. Re-applies automatically when Claude Code updates.",
-  "version": "0.7.7",
+  "description": "Patches the Claude Code VS Code extension: auto-attach defaults to OFF (configurable), Ctrl+F context-attach toggle, session-scoped model switching, session-scoped effort switching, configurable quick-send slots (model + effort) behind three colored send buttons, Ctrl+0/1/2/3 and Ctrl+M, per-session model badge, capped/scrollable prompt bubbles, markdown-preview context attach, vscode://…/open URIs open in the locked Claude editor group and auto-send their prompt. Re-applies automatically when Claude Code updates.",
+  "version": "0.7.9",
   "publisher": "dmarchal",
   "private": true,
   "license": "UNLICENSED",
@@ -34,32 +34,198 @@
         "claude-code-no-auto-attach.detachContextByDefault": {
           "type": "boolean",
           "default": true,
-          "description": "Start new Claude Code sessions with the current file/selection NOT attached as context (the original reason for this extension). Turn OFF to keep upstream behavior (attached by default). Either way, Ctrl+F toggles the attachment while a Claude session is focused. Applied by patching, so changing it re-applies the patch and prompts a window reload."
+          "description": "Start new Claude Code sessions with the current file/selection NOT attached as context (the original reason for this extension). Turn OFF to keep upstream behavior (attached by default). Either way, Ctrl+F toggles the attachment while a Claude session is focused. Applied by patching, so changing it re-applies the patch and prompts a window reload.",
+          "order": 1
         },
         "claude-code-no-auto-attach.autoApproveProtectedPathWrites": {
           "type": "boolean",
           "default": false,
-          "description": "Auto-approve Write/Edit/MultiEdit/NotebookEdit/Bash prompts that fire against Claude's own protected paths (e.g. .claude/, ~/.claude/settings.json) despite bypassPermissions. Fires while permission mode is bypassPermissions (or before any setPermissionMode call has happened in the session). Only enable in trusted workspaces."
+          "description": "Auto-approve Write/Edit/MultiEdit/NotebookEdit/Bash prompts that fire against Claude's own protected paths (e.g. .claude/, ~/.claude/settings.json) despite bypassPermissions. Fires while permission mode is bypassPermissions (or before any setPermissionMode call has happened in the session). Only enable in trusted workspaces.",
+          "order": 2
         },
         "claude-code-no-auto-attach.sessionScopedModelSwitch": {
           "type": "boolean",
           "default": true,
-          "description": "Make model switching session-scoped: selecting a model in a Claude Code session no longer rewrites the global default in ~/.claude/settings.json. Toggle OFF temporarily if you want a model switch to become the new global default. Takes effect immediately, no reload needed."
+          "description": "Make model switching session-scoped: selecting a model in a Claude Code session no longer rewrites the global default in ~/.claude/settings.json. Toggle OFF temporarily if you want a model switch to become the new global default. Takes effect immediately, no reload needed.",
+          "order": 3
         },
         "claude-code-no-auto-attach.uriOpensInEditor": {
           "type": "boolean",
           "default": true,
-          "description": "Make vscode://anthropic.claude-code/open?prompt=…&session=… URIs open/resume in the locked editor group you keep Claude Code in (creating and locking a side column when there is none) instead of hijacking the active editor group. The injected code reads the setting on every URI, so toggling takes effect immediately, no reload needed."
+          "description": "Make vscode://anthropic.claude-code/open?prompt=…&session=… URIs open/resume in the locked editor group you keep Claude Code in (creating and locking a side column when there is none) instead of hijacking the active editor group. The injected code reads the setting on every URI, so toggling takes effect immediately, no reload needed.",
+          "order": 4
         },
         "claude-code-no-auto-attach.uriAutoSendsPrompt": {
           "type": "boolean",
           "default": true,
-          "description": "When a vscode://anthropic.claude-code/open URI carries a prompt (and uriOpensInEditor is on), send it right away instead of just typing it into the composer. Waits for the session to be idle; gives up after 30s and leaves the prompt typed."
+          "description": "When a vscode://anthropic.claude-code/open URI carries a prompt (and uriOpensInEditor is on), send it right away instead of just typing it into the composer. Waits for the session to be idle; gives up after 30s and leaves the prompt typed.",
+          "order": 5
         },
         "claude-code-no-auto-attach.sessionScopedEffortSwitch": {
           "type": "boolean",
           "default": true,
-          "description": "Make effort switching session-scoped: changing the effort level (via the native picker or the model buttons/shortcuts that now set effort per model family) no longer rewrites the global default in ~/.claude/settings.json. Toggle OFF temporarily if you want an effort change to become the new global default. Takes effect immediately, no reload needed."
+          "description": "Make effort switching session-scoped: changing the effort level (via the native picker or a quick-send slot) no longer rewrites the global default in ~/.claude/settings.json. Toggle OFF temporarily if you want an effort change to become the new global default. Takes effect immediately, no reload needed.",
+          "order": 6
+        },
+        "claude-code-no-auto-attach.quickSend.purple.model": {
+          "type": "string",
+          "enum": [
+            "fable",
+            "opus",
+            "sonnet",
+            "haiku"
+          ],
+          "enumItemLabels": [
+            "Fable",
+            "Opus",
+            "Sonnet",
+            "Haiku"
+          ],
+          "default": "fable",
+          "order": 100,
+          "markdownDescription": "Model that the purple send button and `Ctrl+0` switch the session to. `Ctrl+M` and a click on the model badge go through the slots in shortcut order. Read at runtime, no reload needed."
+        },
+        "claude-code-no-auto-attach.quickSend.purple.effort": {
+          "type": "string",
+          "enum": [
+            "unchanged",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "enumDescriptions": [
+            "Leave the session's effort as it is (the model's default from `modelSettings` until you pick one).",
+            "",
+            "",
+            "",
+            "",
+            ""
+          ],
+          "default": "high",
+          "order": 101,
+          "markdownDescription": "Effort that the purple send button and `Ctrl+0` set, session-scoped. Skipped when the model doesn't support that level."
+        },
+        "claude-code-no-auto-attach.quickSend.red.model": {
+          "type": "string",
+          "enum": [
+            "fable",
+            "opus",
+            "sonnet",
+            "haiku"
+          ],
+          "enumItemLabels": [
+            "Fable",
+            "Opus",
+            "Sonnet",
+            "Haiku"
+          ],
+          "default": "opus",
+          "order": 102,
+          "markdownDescription": "Model that `Ctrl+1` (no button) switch the session to. `Ctrl+M` and a click on the model badge go through the slots in shortcut order. Read at runtime, no reload needed."
+        },
+        "claude-code-no-auto-attach.quickSend.red.effort": {
+          "type": "string",
+          "enum": [
+            "unchanged",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "enumDescriptions": [
+            "Leave the session's effort as it is (the model's default from `modelSettings` until you pick one).",
+            "",
+            "",
+            "",
+            "",
+            ""
+          ],
+          "default": "xhigh",
+          "order": 103,
+          "markdownDescription": "Effort that `Ctrl+1` (no button) set, session-scoped. Skipped when the model doesn't support that level."
+        },
+        "claude-code-no-auto-attach.quickSend.yellow.model": {
+          "type": "string",
+          "enum": [
+            "fable",
+            "opus",
+            "sonnet",
+            "haiku"
+          ],
+          "enumItemLabels": [
+            "Fable",
+            "Opus",
+            "Sonnet",
+            "Haiku"
+          ],
+          "default": "sonnet",
+          "order": 104,
+          "markdownDescription": "Model that the yellow send button and `Ctrl+2` switch the session to. `Ctrl+M` and a click on the model badge go through the slots in shortcut order. Read at runtime, no reload needed."
+        },
+        "claude-code-no-auto-attach.quickSend.yellow.effort": {
+          "type": "string",
+          "enum": [
+            "unchanged",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "enumDescriptions": [
+            "Leave the session's effort as it is (the model's default from `modelSettings` until you pick one).",
+            "",
+            "",
+            "",
+            "",
+            ""
+          ],
+          "default": "medium",
+          "order": 105,
+          "markdownDescription": "Effort that the yellow send button and `Ctrl+2` set, session-scoped. Skipped when the model doesn't support that level."
+        },
+        "claude-code-no-auto-attach.quickSend.teal.model": {
+          "type": "string",
+          "enum": [
+            "fable",
+            "opus",
+            "sonnet",
+            "haiku"
+          ],
+          "enumItemLabels": [
+            "Fable",
+            "Opus",
+            "Sonnet",
+            "Haiku"
+          ],
+          "default": "haiku",
+          "order": 106,
+          "markdownDescription": "Model that the teal send button and `Ctrl+3` switch the session to. `Ctrl+M` and a click on the model badge go through the slots in shortcut order. Read at runtime, no reload needed."
+        },
+        "claude-code-no-auto-attach.quickSend.teal.effort": {
+          "type": "string",
+          "enum": [
+            "unchanged",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "enumDescriptions": [
+            "Leave the session's effort as it is (the model's default from `modelSettings` until you pick one).",
+            "",
+            "",
+            "",
+            "",
+            ""
+          ],
+          "default": "medium",
+          "order": 107,
+          "markdownDescription": "Effort that the teal send button and `Ctrl+3` set, session-scoped. Skipped when the model doesn't support that level."
         }
       }
     }
