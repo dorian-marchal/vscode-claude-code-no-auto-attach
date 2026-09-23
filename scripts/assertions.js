@@ -287,6 +287,21 @@ const WEBVIEW = [
     },
   },
   {
+    // Since 2.1.270 the launch-time read-back skips the effort (`{effort:!1}`); older
+    // bundles adopt it on every read, so there is nothing to open up.
+    name: 'session-effort-adopt',
+    rel: 'webview/index.js',
+    applies: (clean) => /if\([\w$]+\.effort!==!1&&this\.effortChangeCount===/.test(clean),
+    check(patched) {
+      const adopt = patched.match(
+        /if\(\/\*__ccaaEffortAdopt\*\/([\w$]+)\?\.ccaaEffortRestored===!0&&this\.effortChangeCount===([\w$]+)\|\|\/\*__ccaaEffortAdoptEnd\*\/[\w$]+\.effort!==!1&&this\.effortChangeCount===([\w$]+)\)this\.adoptAppliedEffort\(([\w$]+)\)/
+      );
+      if (!adopt) return 'the read-back does not adopt the effort of an answer tagged ccaaEffortRestored';
+      if (adopt[1] !== adopt[4]) return 'the tag is read off another object than the applied settings it adopts';
+      return adopt[2] === adopt[3] ? null : 'the tagged branch drops the effort change counter guard';
+    },
+  },
+  {
     // Upstream drift canary: the affordances the patches above anchor on. When Anthropic
     // renames or removes one, this fails loudly instead of a patch becoming a quiet no-op.
     name: 'upstream-affordances',
@@ -301,6 +316,7 @@ const WEBVIEW = [
         ['the session selection writer', 'applySelectionUpdate'],
         ['a setting read off the webview state', '.config.value?.spinnerVerbsConfig'],
         ['the session effort setter', 'setEffortLevel('],
+        ['the applied-effort adopter', 'adoptAppliedEffort('],
       ]),
   },
   {
@@ -422,6 +438,33 @@ const EXTENSION = [
       )
         ? null
         : 'the flag flip is not immediately followed by the writeUserSettingsAndPush it applies to';
+    },
+  },
+  {
+    // The restore has to run before upstream's own read, once per channel, from the main
+    // chain only (a subagent's turns carry their own effort), and answer in the handler's
+    // response shape with the tag the webview adopts on.
+    name: 'session-effort-restore',
+    rel: 'extension.js',
+    check(patched) {
+      const handler = patched.indexOf('case"get_applied_settings":');
+      if (handler === -1) return 'no get_applied_settings handler';
+      const restore = block(patched, 'EffortRestore');
+      if (restore === null) return 'no /*__ccaaEffortRestore*/ block';
+      const start = patched.indexOf('/*__ccaaEffortRestore*/');
+      const upstreamRead = patched.indexOf('.query.getSettings()', patched.indexOf('/*__ccaaEffortRestoreEnd*/'));
+      if (start < handler || upstreamRead === -1 || patched.slice(handler, start).includes('.query.getSettings()')) {
+        return 'the block does not sit at the top of the get_applied_settings handler';
+      }
+      return need(restore, [
+        ['a once-per-channel guard', 'WeakSet'],
+        ['the sessionScopedEffortSwitch gate', '"sessionScopedEffortSwitch"'],
+        ['the session transcript lookup', '.jsonl"'],
+        ['the main-chain filter', '.isSidechain'],
+        ['the session-scoped effort push', '.query.applyFlagSettings({effortLevel:'],
+        ['the handler response type', 'type:"get_applied_settings_response"'],
+        ['the tag the webview adopts on', 'ccaaEffortRestored:!0'],
+      ]);
     },
   },
   {
@@ -570,6 +613,8 @@ const EXTENSION = [
         ['the tool-permission request', 'can_use_tool'],
         ['the permission-mode setter', 'setPermissionMode'],
         ['the settings write', 'writeUserSettingsAndPush'],
+        ['the applied-settings answer', 'type:"get_applied_settings_response"'],
+        ['the flag-settings push', 'applyFlagSettings('],
         ['the uri /open fallback', 'primaryEditor.open'],
         ['the editor-open command', 'claude-vscode.editor.open'],
         ['the active-editor subscription', 'onDidChangeActiveTextEditor'],

@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const vm = require('vm');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v57*/';
+const MARKER = '/*claude-code-no-auto-attach:v58*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -706,6 +706,31 @@ function revertQuestionAutoAdvance(content) {
   return content.replace(NO_ADVANCE_REVERT_RE, (_, original) => original);
 }
 
+const EFFORT_ADOPT_SENTINEL_RE = /\/\*__ccaaEffortAdopt\*\/[\s\S]*?\/\*__ccaaEffortAdoptEnd\*\//g;
+
+// A resumed session reads its applied settings back once at launch, with `{effort:!1}`: the
+// webview keeps the effort it seeded from the host config (the global default). When the
+// host put the session's own effort back (see injectEffortRestore), its answer carries
+// `ccaaEffortRestored`; let that one read adopt the effort, still guarded by the effort
+// change counter so a pick made during the read wins.
+function injectEffortAdopt(content) {
+  const anchorRe =
+    /if\(([\w$]+)\.effort!==!1&&this\.effortChangeCount===([\w$]+)\)this\.adoptAppliedEffort\(([\w$]+)\)/g;
+  const matches = [...content.matchAll(anchorRe)];
+  if (matches.length === 0) {
+    return { ok: false, reason: 'applied-effort read-back not found (Claude Code internals may have changed)' };
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${matches.length} applied-effort read-backs found` };
+  }
+
+  const [anchor, , countVar, appliedVar] = matches[0];
+  const insertion =
+    `/*__ccaaEffortAdopt*/${appliedVar}?.ccaaEffortRestored===!0&&this.effortChangeCount===${countVar}||` +
+    `/*__ccaaEffortAdoptEnd*/`;
+  return { ok: true, content: replaceMatch(content, matches[0], 'if(' + insertion + anchor.slice(3)) };
+}
+
 // --- extension.js sub-patches ---
 
 const URI_OPEN_EXT_SENTINEL_RE = /\/\*__ccaaUriOpenExt\*\/[\s\S]*?\/\*__ccaaUriOpenExtEnd\*\//g;
@@ -957,6 +982,67 @@ function injectSessionScopedEffort(content) {
     `require("vscode").workspace.getConfiguration("claude-code-no-auto-attach").get("sessionScopedEffortSwitch",true))` +
     `${flagsVar}=!0}}catch(__ccaaEffErr){}/*__ccaaSessionEffortEnd*/`;
   return { ok: true, content: replaceMatch(content, matches[0], insertion + anchor) };
+}
+
+const EFFORT_RESTORE_SENTINEL_RE = /\/\*__ccaaEffortRestore\*\/[\s\S]*?\/\*__ccaaEffortRestoreEnd\*\//g;
+
+// A session-scoped effort lives in the CLI process's flag settings, so a resumed session
+// (Reopen Closed Session, or any resume) comes back at the default effort. The CLI does
+// bring the model back, and it records the effort of every turn in the transcript
+// (`"effort":…` on each assistant entry), but it does not read that effort on resume.
+// On a channel's first applied-settings read (the webview makes it right after launch),
+// read the effort of the transcript's last main-chain assistant entry, and when the CLI
+// applies a different one, push it back as a flag setting (what a session-scoped pick
+// does) and tag the answer so the webview adopts it (see injectEffortAdopt). A session
+// that never changed its effort already matches, so it stays unpinned. Only when
+// `sessionScopedEffortSwitch` is on: with it off, picks go to the global default.
+function injectEffortRestore(content) {
+  const anchorRe =
+    /case"get_applied_settings":\{let ([\w$]+)=[\w$]+\.channelId\|\|"";return this\.withChannel\(\1,async\(([\w$]+)\)=>\{/g;
+  const matches = [...content.matchAll(anchorRe)];
+  if (matches.length === 0) {
+    return { ok: false, reason: 'get_applied_settings handler not found (Claude Code internals may have changed)' };
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${matches.length} get_applied_settings handlers found` };
+  }
+
+  const [anchor, , channelVar] = matches[0];
+  const insertion =
+    `/*__ccaaEffortRestore*/try{var __ccaaSeen=globalThis.__ccaaEffortSeen??=new WeakSet;` +
+    `if(!__ccaaSeen.has(${channelVar})){__ccaaSeen.add(${channelVar});` +
+    `var __ccaaEffort=await(async(__ccaaId)=>{` +
+    `if(typeof __ccaaId!=="string"||!/^[\\w-]+$/.test(__ccaaId))return;` +
+    `if(!require("vscode").workspace.getConfiguration("claude-code-no-auto-attach").get("sessionScopedEffortSwitch",true))return;` +
+    `var __ccaaFs=require("fs").promises,__ccaaPath=require("path");` +
+    `var __ccaaRoot=__ccaaPath.join(process.env.CLAUDE_CONFIG_DIR||__ccaaPath.join(require("os").homedir(),".claude"),"projects");` +
+    // The project folder name is derived from the session's cwd; the session id alone is
+    // unique, so look for it in every project folder instead of re-deriving that name.
+    `var __ccaaFile;for(var __ccaaDir of await __ccaaFs.readdir(__ccaaRoot)){` +
+    `var __ccaaCandidate=__ccaaPath.join(__ccaaRoot,__ccaaDir,__ccaaId+".jsonl");` +
+    `try{await __ccaaFs.access(__ccaaCandidate);__ccaaFile=__ccaaCandidate;break}catch{}}` +
+    `if(!__ccaaFile)return;` +
+    // Read the tail only, in growing windows: the last turn is near the end.
+    `var __ccaaHandle=await __ccaaFs.open(__ccaaFile,"r");try{` +
+    `var __ccaaSize=(await __ccaaHandle.stat()).size;` +
+    `for(var __ccaaWindow of[262144,4194304,16777216]){` +
+    `var __ccaaStart=Math.max(0,__ccaaSize-__ccaaWindow),__ccaaBuf=Buffer.alloc(__ccaaSize-__ccaaStart);` +
+    `await __ccaaHandle.read(__ccaaBuf,0,__ccaaBuf.length,__ccaaStart);` +
+    `var __ccaaLines=__ccaaBuf.toString("utf8").split("\\n");if(__ccaaStart>0)__ccaaLines.shift();` +
+    `for(var __ccaaI=__ccaaLines.length-1;__ccaaI>=0;__ccaaI--){var __ccaaLine=__ccaaLines[__ccaaI];` +
+    `if(!__ccaaLine.includes('"effort":')||!__ccaaLine.includes('"type":"assistant"'))continue;` +
+    `try{var __ccaaEntry=JSON.parse(__ccaaLine);` +
+    `if(__ccaaEntry.type==="assistant"&&!__ccaaEntry.isSidechain&&typeof __ccaaEntry.effort==="string")return __ccaaEntry.effort}catch{}}` +
+    `if(__ccaaStart===0)return}` +
+    `}finally{await __ccaaHandle.close()}` +
+    `})(${channelVar}.sessionId);` +
+    `if(__ccaaEffort){var __ccaaApplied=(await ${channelVar}.query.getSettings()).applied;` +
+    `if(typeof __ccaaApplied?.effort==="string"&&__ccaaApplied.effort!==__ccaaEffort){` +
+    `await ${channelVar}.query.applyFlagSettings({effortLevel:__ccaaEffort});` +
+    `__ccaaApplied=(await ${channelVar}.query.getSettings()).applied;` +
+    `if(__ccaaApplied)return{type:"get_applied_settings_response",applied:{...__ccaaApplied,ccaaEffortRestored:!0}}}}}` +
+    `}catch(__ccaaRestoreErr){}/*__ccaaEffortRestoreEnd*/`;
+  return { ok: true, content: replaceMatch(content, matches[0], anchor + insertion) };
 }
 
 const QUICK_SEND_STATE_SENTINEL_RE = /\/\*__ccaaQuickSendState\*\/[\s\S]*?\/\*__ccaaQuickSendStateEnd\*\//g;
@@ -1221,6 +1307,7 @@ function computeWebviewPatch(content, { detachContextByDefault = true } = {}) {
     { name: 'question-keeps-focus', inject: injectAskQuestionFocus },
     { name: 'question-notes-input', inject: injectAskQuestionNotes },
     { name: 'question-no-auto-advance', inject: injectNoQuestionAutoAdvance },
+    { name: 'session-effort-adopt', inject: injectEffortAdopt },
     // Last, so its code can't add a second match to any anchor above.
     { name: 'quick-send-lib', inject: injectQuickSendLib }
   );
@@ -1243,6 +1330,7 @@ function revertWebviewPatch(content) {
   next = next.replace(MODEL_UI_SENTINEL_RE, '');
   next = next.replace(SEND_MODEL_BUTTONS_SENTINEL_RE, '');
   next = next.replace(URI_OPEN_WV_SENTINEL_RE, '');
+  next = next.replace(EFFORT_ADOPT_SENTINEL_RE, '');
   return { reverted: true, content: next };
 }
 
@@ -1308,6 +1396,7 @@ function computeExtensionPatch(content) {
     { name: 'permission-mode-capture', inject: injectPermissionModeCapture },
     { name: 'session-scoped-model', inject: injectSessionScopedModel },
     { name: 'session-scoped-effort', inject: injectSessionScopedEffort },
+    { name: 'session-effort-restore', inject: injectEffortRestore },
     { name: 'markdown-preview-context', inject: injectMarkdownPreviewContext },
     { name: 'uri-open-in-editor', inject: injectUriOpenInEditor },
     { name: 'system-prompt-trim', inject: injectSystemPromptTrim },
@@ -1325,6 +1414,7 @@ function revertExtensionPatch(content) {
   next = revertPermissionModeCapture(next);
   next = next.replace(SESSION_MODEL_SENTINEL_RE, '');
   next = next.replace(SESSION_EFFORT_SENTINEL_RE, '');
+  next = next.replace(EFFORT_RESTORE_SENTINEL_RE, '');
   next = next.replace(MD_PREVIEW_SENTINEL_RE, '');
   next = next.replace(MD_PREVIEW2_SENTINEL_RE, '');
   next = next.replace(MD_PREVIEW3_SENTINEL_RE, '');
