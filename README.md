@@ -100,7 +100,7 @@ Each patched file is prefixed with a versioned marker so re-launches don't re-pa
 ./install
 ```
 
-(packages the vsix with `vsce` and runs `code --install-extension`)
+(packages the vsix into `dist/` with `vsce` and runs `code --install-extension`)
 
 ## Commands
 

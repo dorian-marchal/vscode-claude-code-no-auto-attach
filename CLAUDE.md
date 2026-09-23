@@ -23,7 +23,7 @@ Since 2.1.251 the minifier also uses `$` as a bare variable name — anchor rege
 
 ## Build / release
 
-- `./install` — packages the vsix via `vsce` and `code --install-extension --force`. Reload window after.
+- `./install` — packages the vsix into `dist/` via `vsce` and `code --install-extension --force`. Reload window after.
 - Bump `version` in [package.json](package.json) before packaging (vsix filename is version-derived). `.vsix` files are gitignored.
 - `node scripts/check.js` is the test: it dry-runs every sub-patch against each installed Claude Code version (reverting the on-disk marker first), parses the result, and checks the revert roundtrip. Run it after any anchor change; `--write-clean DIR` dumps the clean bundles for inspection. `/update` walks the whole release-update routine.
 - Three more checks run in the same pass, because an anchor matching and a bundle parsing says nothing about whether the injection *means* the right thing (two bugs shipped green through the checks above: one suppressed the session's `applySelectionUpdate` and silently removed the composer's file chip, one left a retired patch's sentinel block behind because its revert helper was deleted with it):

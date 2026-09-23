@@ -4,3 +4,4 @@
 **/*.vsix
 .claude/**
 scripts/**
+dist/**
