@@ -17,6 +17,8 @@
 // minifier uses a bare `$` as a variable name. Any replace() whose replacement embeds a
 // captured name must use the function form.
 
+const fs = require('fs');
+const path = require('path');
 const pkg = require('../package.json');
 
 // --- small helpers ---
@@ -302,6 +304,66 @@ const WEBVIEW = [
     },
   },
   {
+    // The dictation state is handed over *before* the reset helper wipes it, and it is the
+    // helper's own argument that is handed over.
+    name: 'voice-cleanup-snapshot',
+    rel: 'webview/index.js',
+    check: (patched) =>
+      /function [\w$]+\(([\w$]+)\)\{\/\*__ccaaVoiceSnap\*\/try\{globalThis\.__ccaaVoiceSnapshot\?\.\(\1\)\}catch\([\w$]+\)\{\}\/\*__ccaaVoiceSnapEnd\*\/\1\.gen\+\+,\1\.prefix=null,/.test(
+        patched
+      )
+        ? null
+        : 'the dictation reset does not hand its state to __ccaaVoiceSnapshot before wiping it',
+  },
+  {
+    // The cleaned text only lands when the composer still holds exactly what dictation
+    // wrote, replaces the dictated part only, and stays undoable when the composer has focus.
+    // The message type and the snapshot global are the ones the other halves use.
+    name: 'voice-cleanup-lib',
+    rel: 'webview/index.js',
+    check(patched) {
+      const injected = block(patched, 'VoiceLib');
+      if (!injected) return 'no /*__ccaaVoiceLib*/ block';
+      if (!/^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n\/\*__ccaaQuickSendLib\*\/[\s\S]*?\/\*__ccaaQuickSendLibEnd\*\/\n\/\*__ccaaVoiceLib\*\//.test(patched)) {
+        return 'the voice lib does not sit at the top of the bundle, right after the quick-send lib';
+      }
+      const host = fs.readFileSync(path.join(__dirname, '..', 'extension.js'), 'utf8');
+      if (!host.includes("type: 'ccaa-voice'")) return 'the host no longer posts "ccaa-voice" messages';
+      const problem = need(injected, [
+        ['the snapshot global the reset helper calls', 'globalThis.__ccaaVoiceSnapshot='],
+        ['the host message type', '__ccaaM.type!=="ccaa-voice"'],
+        ['the composer lookup', `'[role="textbox"][aria-label="Message input"]'`],
+        ['the untouched-composer guard', '__ccaaEl.textContent!==__ccaaSnap.text'],
+        ['the dictated part kept between prefix and suffix', '__ccaaP+__ccaaLead+__ccaaCleaned+__ccaaTrail+__ccaaSuf'],
+        ['the undoable swap', 'document.execCommand("insertText",!1,__ccaaNext)'],
+        ['the input event for the composer state', 'new Event("input",{bubbles:!0})'],
+      ]);
+      if (problem) return problem;
+      // A stop click saves the state before "cleaning" arrives: clearing it there loses it.
+      const cleaning = injected.match(/if\(__ccaaM\.state==="cleaning"\)\{([^}]*)\}/);
+      if (!cleaning) return 'no "cleaning" branch';
+      if (cleaning[1].includes('__ccaaVoiceSnap=')) return 'the "cleaning" message clears the saved dictation state';
+      // A send made while recording or cleaning is held before the composer sees it, and
+      // replayed after the cleaned text lands, on any other message than "cleaning".
+      const heldProblem = need(injected, [
+        ['the recording check', `'button[aria-label="Stop recording"]'`],
+        ['the Enter hold in the capture phase', '__ccaaEv.preventDefault();__ccaaEv.stopImmediatePropagation();if(__ccaaVoiceHeld)return;'],
+        ['the Enter replay on the composer', 'new KeyboardEvent("keydown",__ccaaInit)'],
+        ['the send button replay', '__ccaaForm.requestSubmit()'],
+        ['the 3s cap', 'setTimeout(__ccaaVoiceRelease,3e3)'],
+        ['the recording stop through the dictation shortcut', '{key:"d",code:"KeyD",metaKey:!0,ctrlKey:!0,cancelable:!0}'],
+      ]);
+      if (heldProblem) return heldProblem;
+      if ((injected.match(/addEventListener\("(?:keydown|submit)",[\s\S]*?\},!0\)/g) || []).length !== 2) {
+        return 'the keydown and submit holds are not both capture listeners';
+      }
+      if (!/__ccaaVoiceApply\(__ccaaSnap,__ccaaM\.text\.trim\(\)\);__ccaaVoiceRelease\(\)/.test(injected)) {
+        return 'the held send is not replayed right after the cleaned text is applied';
+      }
+      return host.includes("send({ state: 'skipped' });") ? null : 'the host does not post "skipped" when no cleanup runs';
+    },
+  },
+  {
     // Upstream drift canary: the affordances the patches above anchor on. When Anthropic
     // renames or removes one, this fails loudly instead of a patch becoming a quiet no-op.
     name: 'upstream-affordances',
@@ -317,6 +379,10 @@ const WEBVIEW = [
         ['a setting read off the webview state', '.config.value?.spinnerVerbsConfig'],
         ['the session effort setter', 'setEffortLevel('],
         ['the applied-effort adopter', 'adoptAppliedEffort('],
+        ['the composer input', '"aria-label":"Message input"'],
+        ['the dictation state reset', '.prefix=null,$.suffix="",$.lastSetInput=null'],
+        ['the recording mic label', '?"Stop recording":"Voice dictation"'],
+        ['the dictation shortcut', '.key.toLowerCase()==="d"'],
       ]),
   },
   {
@@ -605,6 +671,37 @@ const EXTENSION = [
         : 'the quickSend settings are not in the listener that re-posts the webview state',
   },
   {
+    // The recording start reaches this extension from the real VS Code handler, not from
+    // the base class stub that only throws.
+    name: 'voice-cleanup-start',
+    rel: 'extension.js',
+    check(patched) {
+      const hooks = windows(patched, '/*__ccaaVoiceStart*/', 0, 0).length;
+      if (hooks !== 1) return `expected one start hook, found ${hooks}`;
+      if (!/handleStartSpeechToText\(([\w$]+)\)\{\/\*__ccaaVoiceStart\*\/try\{globalThis\.__ccaaVoiceHostStart\?\.\(\1\)\}catch\([\w$]+\)\{\}\/\*__ccaaVoiceStartEnd\*\/if\(this\.output\.info\(/.test(patched)) {
+        return 'the start hook is not the first statement of the VS Code speech-to-text start handler';
+      }
+      const host = fs.readFileSync(path.join(__dirname, '..', 'extension.js'), 'utf8');
+      return host.includes('globalThis.__ccaaVoiceHostStart = onVoiceStart;') ? null : 'the extension does not register __ccaaVoiceHostStart';
+    },
+  },
+  {
+    // At the end of the stream, the hook gets the channel and the *last* transcript the
+    // loop saw (each message carries the whole text so far), plus this webview's poster.
+    name: 'voice-cleanup-done',
+    rel: 'extension.js',
+    check(patched) {
+      const done = patched.match(
+        /for await\(let ([\w$]+) of [\w$]+\)([\w$]+)=\1,this\.send\(\{type:"speech_to_text_message",channelId:([\w$]+),text:\1,done:!1\}\)\}catch\([\w$]+\)\{[^]{0,300}?\}finally\{\/\*__ccaaVoiceDone\*\/try\{globalThis\.__ccaaVoiceHostDone\?\.\(([\w$]+),([\w$]+),\(__ccaaVoiceMsg\)=>this\.webview\.postMessage\(__ccaaVoiceMsg\)\)\}/
+      );
+      if (!done) return 'the transcript stream does not call __ccaaVoiceHostDone first thing in its finally block';
+      if (done[4] !== done[3]) return 'the hook gets another channel than the stream';
+      if (done[5] !== done[2]) return 'the hook gets another value than the last transcript';
+      const host = fs.readFileSync(path.join(__dirname, '..', 'extension.js'), 'utf8');
+      return host.includes('globalThis.__ccaaVoiceHostDone = onVoiceDone;') ? null : 'the extension does not register __ccaaVoiceHostDone';
+    },
+  },
+  {
     name: 'upstream-affordances',
     rel: 'extension.js',
     check: (_patched, clean) =>
@@ -622,6 +719,9 @@ const EXTENSION = [
         ['the workspace-relative link rule', 'The URL links should be relative paths'],
         ['the webview state builder', 'spinnerVerbsConfig:this.settings.getSpinnerVerbsConfig(),'],
         ['the state-push settings listener', 'affectsConfiguration("claudeCode.spinnerVerbs"))this.pushStateUpdate()'],
+        ['the speech-to-text stream message', 'type:"speech_to_text_message"'],
+        ['the speech-to-text start handler', 'handleStartSpeechToText('],
+        ['the bundled claude binary', '"native-binary"'],
       ]),
   },
 ];

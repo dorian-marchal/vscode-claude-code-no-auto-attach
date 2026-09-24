@@ -1,8 +1,8 @@
 {
   "name": "claude-code-no-auto-attach",
   "displayName": "Claude Code: No Auto-Attach",
-  "description": "Patches the Claude Code VS Code extension: auto-attach defaults to OFF (configurable), Ctrl+F context-attach toggle, session-scoped model switching, session-scoped effort switching, configurable quick-send slots (model + effort) behind three colored send buttons, Ctrl+0/1/2/3 and Ctrl+M, per-session model badge, capped/scrollable prompt bubbles, markdown-preview context attach, vscode://…/open URIs open in the locked Claude editor group and auto-send their prompt. Re-applies automatically when Claude Code updates.",
-  "version": "0.7.10",
+  "description": "Patches the Claude Code VS Code extension: auto-attach defaults to OFF (configurable), Ctrl+F context-attach toggle, session-scoped model switching, session-scoped effort switching, configurable quick-send slots (model + effort) behind three colored send buttons, Ctrl+0/1/2/3 and Ctrl+M, per-session model badge, capped/scrollable prompt bubbles, markdown-preview context attach, vscode://…/open URIs open in the locked Claude editor group and auto-send their prompt. Voice-dictated prompts are cleaned up by Haiku (fillers, stutters, broken words) when the recording stops. Re-applies automatically when Claude Code updates.",
+  "version": "0.8.1",
   "publisher": "dmarchal",
   "private": true,
   "license": "UNLICENSED",
@@ -66,6 +66,12 @@
           "default": true,
           "description": "Make effort switching session-scoped: changing the effort level (via the native picker or a quick-send slot) no longer rewrites the global default in ~/.claude/settings.json. Toggle OFF temporarily if you want an effort change to become the new global default. Takes effect immediately, no reload needed.",
           "order": 6
+        },
+        "claude-code-no-auto-attach.voiceCleanup.enabled": {
+          "type": "boolean",
+          "default": true,
+          "order": 7,
+          "markdownDescription": "When a Claude Code dictation stops, have Haiku clean up the dictated text: remove fillers (uh, um, you know), stutters, repeated words and false starts, fix words the speech-to-text clearly broke, and join fragments into full sentences, leaving the wording otherwise alone. Runs Claude Code's own `claude` binary with your login (no API key), in about a second; the composer pulses meanwhile. Sending while it runs waits for the cleaned text (3s at most), typing before it finishes keeps the raw text, and `Cmd+Z` brings it back after. Read on every recording, no reload needed."
         },
         "claude-code-no-auto-attach.quickSend.purple.model": {
           "type": "string",
