@@ -6,7 +6,7 @@ const os = require('os');
 const vm = require('vm');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v60*/';
+const MARKER = '/*claude-code-no-auto-attach:v61*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -604,6 +604,7 @@ function revertAskQuestionFocus(content) {
 const ASK_NOTES_JSX_SENTINEL_RE = /,\/\*__ccaaAskNotes\*\/[\s\S]*?\/\*__ccaaAskNotesEnd\*\//g;
 const ASK_NOTES_OUT_REVERT_RE =
   /\/\*__ccaaAskNotesOut\*\/\(\(__ccaaP\)=>\{[\s\S]*?\}\)\(([\s\S]*?)\)\/\*__ccaaAskNotesOutEnd\*\//g;
+const ASK_NOTES_REPLAY_SENTINEL_RE = /\/\*__ccaaAskNotesReplay\*\/[\s\S]*?\/\*__ccaaAskNotesReplayEnd\*\//g;
 
 // AskUserQuestion only takes free text through the "Other" option, i.e. instead of a choice —
 // picking an option and adding a caveat is impossible in the webview. The CLI side already
@@ -612,13 +613,17 @@ const ASK_NOTES_OUT_REVERT_RE =
 // to read the answer carefully rather than treating it as a plain pick). Its "(notes only)"
 // answer sentinel covers notes without a selection. So this only adds the missing input.
 //
-// Two edits, both required (a notes box that never reaches the model is worse than none):
+// Three edits, all required (a notes box that never reaches the model is worse than none):
 //   1. a free-text box at the end of every question's option list, hidden while "Other" is
 //      selected — "Other" already shows the same box inline, and both write the same state,
 //      so no new hook is added and nothing is lost when switching between the two;
 //   2. the effect that reports the answers back also reports the notes, and fills in the
 //      "(notes only)" answer for a question that got notes but no pick (the submit button is
-//      gated on every question having a non-empty answer).
+//      gated on every question having a non-empty answer). It also saves the picks and text
+//      per question input, for injectAskQuestionDraftRestore;
+//   3. a question still open when the session reloads is asked again locally, and its
+//      answers go out as a plain prompt built from `answers` only. The notes are merged into
+//      those answers first, so they are part of that prompt.
 // Enter in the box submits (it bubbles to the dialog, which owns Enter), Shift+Enter breaks a
 // line, and every other key is stopped so the option list's arrow/digit handling stays out.
 function injectAskQuestionNotes(content) {
@@ -642,6 +647,16 @@ function injectAskQuestionNotes(content) {
     return { ok: false, reason: `ambiguous: ${outMatches.length} question answers effects found` };
   }
 
+  const replayRe =
+    /function [\w$]+\(([\w$]+)\)\{(?=let [\w$]+=\1\.answers\?\?\{\},[\w$]+=\[\];for\(let [\w$]+ of \1\.questions\?\?\[\]\))/g;
+  const replayMatches = [...content.matchAll(replayRe)];
+  if (replayMatches.length === 0) {
+    return { ok: false, reason: 'replayed question answers reader not found (Claude Code internals may have changed)' };
+  }
+  if (replayMatches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${replayMatches.length} replayed question answers readers found` };
+  }
+
   const [jsxWhole, isChecked, jsx, setTextFocused, , input, styles, textMap, question, setText, tail] = jsxMatches[0];
   const notesBox =
     `,/*__ccaaAskNotes*/!${isChecked}("Other")&&${jsx}("div",{` +
@@ -663,6 +678,8 @@ function injectAskQuestionNotes(content) {
   const original = `{questions:${props}.questions,answers:${answers}}`;
   const reportWithNotes =
     `${report}(/*__ccaaAskNotesOut*/((__ccaaP)=>{try{` +
+    `(globalThis.__ccaaAskDrafts||(globalThis.__ccaaAskDrafts=new WeakMap))` +
+    `.set(${props},{selections:${selections},texts:${texts}});` +
     `for(var __ccaaQ of __ccaaP.questions||[]){` +
     `var __ccaaSel=${selections}[__ccaaQ.question];` +
     `if(__ccaaSel&&__ccaaSel.has("Other"))continue;` +
@@ -672,13 +689,55 @@ function injectAskQuestionNotes(content) {
     `}catch(__ccaaE){}return __ccaaP})(${original})/*__ccaaAskNotesOutEnd*/)},` +
     `[${selections},${texts},${props}.questions,${report}])`;
 
-  return { ok: true, content: replaceMatch(withBox, outMatches[0], reportWithNotes) };
+  const [replayHeader, replayInput] = replayMatches[0];
+  const replayWithNotes =
+    replayHeader +
+    `/*__ccaaAskNotesReplay*/${replayInput}=((__ccaaP)=>{try{var __ccaaA={...__ccaaP.answers};` +
+    `for(var __ccaaQ of __ccaaP.questions||[]){` +
+    `var __ccaaN=((__ccaaP.annotations||{})[__ccaaQ.question]?.notes||"").trim();if(!__ccaaN)continue;` +
+    `var __ccaaV=__ccaaA[__ccaaQ.question];` +
+    `__ccaaA[__ccaaQ.question]=(__ccaaV&&__ccaaV!=="(notes only)"?__ccaaV:"(no option selected)")+" — notes: "+__ccaaN}` +
+    `return{...__ccaaP,answers:__ccaaA}}catch(__ccaaE){return __ccaaP}})(${replayInput});/*__ccaaAskNotesReplayEnd*/`;
+
+  // Each edit shifts the content after it, so each anchor is matched again.
+  const withOut = replaceMatch(withBox, [...withBox.matchAll(outRe)][0], reportWithNotes);
+  return { ok: true, content: replaceMatch(withOut, [...withOut.matchAll(replayRe)][0], replayWithNotes) };
 }
 
 function revertAskQuestionNotes(content) {
   return content
     .replace(ASK_NOTES_JSX_SENTINEL_RE, '')
-    .replace(ASK_NOTES_OUT_REVERT_RE, (_, original) => original);
+    .replace(ASK_NOTES_OUT_REVERT_RE, (_, original) => original)
+    .replace(ASK_NOTES_REPLAY_SENTINEL_RE, '');
+}
+
+const ASK_DRAFT_SENTINEL_RE = /\/\*__ccaaAskDraft(Sel|Text)\*\/[\s\S]*?\/\*__ccaaAskDraft\1End\*\//g;
+
+// The question dialog is only mounted while the composer is idle: any change to the composer
+// text (a dictation cleanup landing, for one) hides it for 1.5s, and it comes back as a new
+// component, with no picks and empty notes. The answers effect saves both per question input
+// (see injectAskQuestionNotes); seed the two states from that save when there is one.
+function injectAskQuestionDraftRestore(content) {
+  const anchorRe =
+    /=([\w$]+)\(\(\)=>\{(let ([\w$]+)=\{\};if\(([\w$]+)\.answers&&\4\.questions\)[\s\S]{0,400}?return \3\}\),\[[\w$]+,[\w$]+\]=\1\()\{\}\)/g;
+  const matches = [...content.matchAll(anchorRe)];
+  if (matches.length === 0) {
+    return { ok: false, reason: 'question state initializers not found (Claude Code internals may have changed)' };
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: `ambiguous: ${matches.length} question state initializers found` };
+  }
+
+  const [, useState, rest, , input] = matches[0];
+  const replacement =
+    `=${useState}(()=>{/*__ccaaAskDraftSel*/var __ccaaD=globalThis.__ccaaAskDrafts?.get(${input});` +
+    `if(__ccaaD)return __ccaaD.selections;/*__ccaaAskDraftSelEnd*/${rest}` +
+    `/*__ccaaAskDraftText*/()=>globalThis.__ccaaAskDrafts?.get(${input})?.texts||/*__ccaaAskDraftTextEnd*/{})`;
+  return { ok: true, content: replaceMatch(content, matches[0], replacement) };
+}
+
+function revertAskQuestionDraftRestore(content) {
+  return content.replace(ASK_DRAFT_SENTINEL_RE, '');
 }
 
 const NO_ADVANCE_REVERT_RE = /\/\*__ccaaNoAdvance:([^*]*)\*\//g;
@@ -1450,6 +1509,7 @@ function computeWebviewPatch(content, { detachContextByDefault = true } = {}) {
     { name: 'session-mount-focus', inject: injectSessionMountFocus },
     { name: 'question-keeps-focus', inject: injectAskQuestionFocus },
     { name: 'question-notes-input', inject: injectAskQuestionNotes },
+    { name: 'question-draft-restore', inject: injectAskQuestionDraftRestore },
     { name: 'question-no-auto-advance', inject: injectNoQuestionAutoAdvance },
     { name: 'session-effort-adopt', inject: injectEffortAdopt },
     { name: 'voice-cleanup-snapshot', inject: injectVoiceSnapshot },
@@ -1472,6 +1532,7 @@ function revertWebviewPatch(content) {
   next = revertSessionMountFocus(next);
   next = revertAskQuestionFocus(next);
   next = revertAskQuestionNotes(next);
+  next = revertAskQuestionDraftRestore(next);
   next = revertQuestionAutoAdvance(next);
   next = next.replace(CHIP_CLICK_SENTINEL_RE, '');
   next = next.replace(MODEL_UI_SENTINEL_RE, '');

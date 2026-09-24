@@ -255,24 +255,49 @@ const WEBVIEW = [
         : 'the question-option auto-focus is not prefixed with `document.hasFocus()&&`',
   },
   {
-    // Both edits or neither: a notes box that never reaches the model is worse than none.
+    // All edits or none: a notes box that never reaches the model is worse than none.
     name: 'question-notes-input',
     rel: 'webview/index.js',
     check(patched) {
-      const hasBox = patched.includes('/*__ccaaAskNotes*/');
-      const hasData = patched.includes('/*__ccaaAskNotesOut*/');
-      if (hasBox !== hasData) {
-        return hasBox
-          ? 'the notes box is injected but the answers effect does not report its text'
-          : 'the answers effect reports notes but the notes box is not injected';
+      const edits = {
+        'the notes box': patched.includes('/*__ccaaAskNotes*/'),
+        'the answers effect edit': patched.includes('/*__ccaaAskNotesOut*/'),
+        'the replayed question edit': patched.includes('/*__ccaaAskNotesReplay*/'),
+      };
+      const present = Object.keys(edits).filter((edit) => edits[edit]);
+      if (present.length === 0) return 'none of the notes edits is present';
+      if (present.length < 3) {
+        return `only ${present.join(', ')} present: ${Object.keys(edits).filter((edit) => !edits[edit]).join(', ')} missing`;
       }
-      if (!hasBox) return 'neither the notes box nor the answers edit is present';
-      const out = block(patched, 'AskNotesOut');
-      return need(out, [
+      const missing = need(block(patched, 'AskNotesOut'), [
         ['the annotations payload', '.annotations'],
         ['the notes field', '{notes:'],
         ['the "(notes only)" answer sentinel', '"(notes only)"'],
+        ['the draft save', '__ccaaAskDrafts'],
       ]);
+      if (missing) return missing;
+      // The replayed answers are read by the function that sends them as a prompt.
+      const replay = patched.match(
+        /function [\w$]+\(([\w$]+)\)\{\/\*__ccaaAskNotesReplay\*\/\1=[\s\S]*?\/\*__ccaaAskNotesReplayEnd\*\/let [\w$]+=\1\.answers\?\?\{\}/
+      );
+      if (!replay) return 'the replay edit does not reassign the answers reader input before it reads answers';
+      return need(replay[0], [
+        ['the annotations read', '.annotations'],
+        ['the notes merged into the answer', '" — notes: "'],
+        ['the "(notes only)" answer rewrite', '"(no option selected)"'],
+      ]);
+    },
+  },
+  {
+    // The question dialog unmounts while the composer is busy; picks and notes must come back.
+    name: 'question-draft-restore',
+    rel: 'webview/index.js',
+    check(patched) {
+      const selections = block(patched, 'AskDraftSel');
+      const texts = block(patched, 'AskDraftText');
+      if (!selections || !texts) return 'the picks or the notes state is not seeded from the saved draft';
+      if (!/return __ccaaD\.selections;$/.test(selections)) return 'the picks state does not return the saved picks';
+      return /\?\.texts\|\|$/.test(texts) ? null : 'the notes state does not fall back to `{}` after the saved text';
     },
   },
   {
@@ -383,6 +408,7 @@ const WEBVIEW = [
         ['the dictation state reset', '.prefix=null,$.suffix="",$.lastSetInput=null'],
         ['the recording mic label', '?"Stop recording":"Voice dictation"'],
         ['the dictation shortcut', '.key.toLowerCase()==="d"'],
+        ['the replayed question prompt', 'Answering your earlier question'],
       ]),
   },
   {

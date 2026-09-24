@@ -2,7 +2,7 @@
   "name": "claude-code-no-auto-attach",
   "displayName": "Claude Code: No Auto-Attach",
   "description": "Patches the Claude Code VS Code extension: auto-attach defaults to OFF (configurable), Ctrl+F context-attach toggle, session-scoped model switching, session-scoped effort switching, configurable quick-send slots (model + effort) behind three colored send buttons, Ctrl+0/1/2/3 and Ctrl+M, per-session model badge, capped/scrollable prompt bubbles, markdown-preview context attach, vscode://…/open URIs open in the locked Claude editor group and auto-send their prompt. Voice-dictated prompts are cleaned up by Haiku (fillers, stutters, broken words) when the recording stops. Re-applies automatically when Claude Code updates.",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "publisher": "dmarchal",
   "private": true,
   "license": "UNLICENSED",
