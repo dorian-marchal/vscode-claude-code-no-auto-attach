@@ -341,8 +341,8 @@ const WEBVIEW = [
         : 'the dictation reset does not hand its state to __ccaaVoiceSnapshot before wiping it',
   },
   {
-    // The cleaned text only lands when the composer still holds exactly what dictation
-    // wrote, replaces the dictated part only, and stays undoable when the composer has focus.
+    // The cleaned text only lands when the composer still holds the dictated part unchanged
+    // and no new recording runs, replaces that part only (typed text around it is kept), and stays undoable when the composer has focus.
     // The message type and the snapshot global are the ones the other halves use.
     name: 'voice-cleanup-lib',
     rel: 'webview/index.js',
@@ -358,8 +358,10 @@ const WEBVIEW = [
         ['the snapshot global the reset helper calls', 'globalThis.__ccaaVoiceSnapshot='],
         ['the host message type', '__ccaaM.type!=="ccaa-voice"'],
         ['the composer lookup', `'[role="textbox"][aria-label="Message input"]'`],
-        ['the untouched-composer guard', '__ccaaEl.textContent!==__ccaaSnap.text'],
-        ['the dictated part kept between prefix and suffix', '__ccaaP+__ccaaLead+__ccaaCleaned+__ccaaTrail+__ccaaSuf'],
+        ['the no-new-recording guard', 'if(!__ccaaEl||__ccaaVoiceRecording())return;'],
+        ['the dictated part found at its place, else as its only copy', '__ccaaAt=__ccaaInPlace?__ccaaP.length:__ccaaCur.indexOf(__ccaaMid);'],
+        ['the ambiguous-copy guard', 'if(__ccaaAt<0||!__ccaaInPlace&&__ccaaCur.indexOf(__ccaaMid,__ccaaAt+1)>=0)return;'],
+        ['only the dictated part replaced', '__ccaaCur.slice(0,__ccaaAt)+__ccaaLead+__ccaaCleaned+__ccaaTrail+__ccaaCur.slice(__ccaaAt+__ccaaMid.length)'],
         ['the undoable swap', 'document.execCommand("insertText",!1,__ccaaNext)'],
         ['the input event for the composer state', 'new Event("input",{bubbles:!0})'],
       ]);

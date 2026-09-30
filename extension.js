@@ -6,7 +6,7 @@ const os = require('os');
 const vm = require('vm');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v61*/';
+const MARKER = '/*claude-code-no-auto-attach:v63*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -820,9 +820,9 @@ const VOICE_LIB_SENTINEL_RE = /\/\*__ccaaVoiceLib\*\/[\s\S]*?\/\*__ccaaVoiceLibE
 
 // Webview half of the voice cleanup. The host posts a top-level "ccaa-voice" message when a
 // recording ends: "cleaning" (the composer pulses), then "done" with Haiku's text, or
-// "failed". The result only replaces the dictated part when the composer still holds exactly
-// what dictation wrote — typing, sending or a new recording in the meantime drops it. When
-// the composer has focus the swap goes through execCommand, so Cmd+Z brings the raw
+// "failed". The result replaces the dictated part as long as the composer still holds it
+// unchanged: text typed around it is kept, while editing it, sending or recording again drops
+// the result. When the composer has focus the swap goes through execCommand, so Cmd+Z brings the raw
 // transcript back. Put at the top of the bundle like the quick-send lib: it needs no anchor.
 function injectVoiceLib(content) {
   const lib =
@@ -834,19 +834,30 @@ function injectVoiceLib(content) {
     `var __ccaaVoiceBusy=(__ccaaOn)=>{try{__ccaaVoicePulse?.cancel();__ccaaVoicePulse=null;var __ccaaEl=__ccaaVoiceInput();` +
     `if(__ccaaOn&&__ccaaEl)__ccaaVoicePulse=__ccaaEl.animate([{opacity:1},{opacity:.45}],{duration:600,iterations:1/0,direction:"alternate"})}catch(__ccaaE){}};` +
     `var __ccaaVoiceApply=(__ccaaSnap,__ccaaCleaned)=>{` +
-    `var __ccaaEl=__ccaaVoiceInput();if(!__ccaaEl||__ccaaEl.textContent!==__ccaaSnap.text)return;` +
+    `var __ccaaEl=__ccaaVoiceInput();if(!__ccaaEl||__ccaaVoiceRecording())return;` +
     `var __ccaaT=__ccaaSnap.text,__ccaaP=__ccaaSnap.prefix,__ccaaSuf=__ccaaSnap.suffix;` +
     `if(__ccaaT.length<__ccaaP.length+__ccaaSuf.length||!__ccaaT.startsWith(__ccaaP)||!__ccaaT.endsWith(__ccaaSuf))return;` +
     `var __ccaaMid=__ccaaT.slice(__ccaaP.length,__ccaaT.length-__ccaaSuf.length);if(!__ccaaMid.trim())return;` +
+    // Text typed around the dictated part is kept: find the dictated part in the composer,
+    // at its own place first, else as its only copy. Edited or gone, the raw text stays.
+    `var __ccaaCur=__ccaaEl.textContent,__ccaaInPlace=__ccaaCur.startsWith(__ccaaP+__ccaaMid),` +
+    `__ccaaAt=__ccaaInPlace?__ccaaP.length:__ccaaCur.indexOf(__ccaaMid);` +
+    `if(__ccaaAt<0||!__ccaaInPlace&&__ccaaCur.indexOf(__ccaaMid,__ccaaAt+1)>=0)return;` +
     `var __ccaaLead=__ccaaMid.match(/^\\s*/)[0],__ccaaTrail=__ccaaMid.match(/\\s*$/)[0];` +
-    `var __ccaaNext=__ccaaP+__ccaaLead+__ccaaCleaned+__ccaaTrail+__ccaaSuf;if(__ccaaNext===__ccaaT)return;` +
-    `var __ccaaSel=window.getSelection(),__ccaaDone=!1;` +
-    `if(document.activeElement===__ccaaEl&&__ccaaSel){__ccaaSel.selectAllChildren(__ccaaEl);__ccaaDone=document.execCommand("insertText",!1,__ccaaNext)}` +
+    `var __ccaaNext=__ccaaCur.slice(0,__ccaaAt)+__ccaaLead+__ccaaCleaned+__ccaaTrail+__ccaaCur.slice(__ccaaAt+__ccaaMid.length);` +
+    `if(__ccaaNext===__ccaaCur)return;` +
+    `var __ccaaSel=window.getSelection(),__ccaaFocused=document.activeElement===__ccaaEl&&!!__ccaaSel,__ccaaDone=!1;` +
+    // The caret goes to the end of the cleaned part, as dictation leaves it, unless it sits
+    // outside the dictated part (in typed text): then it stays where it was.
+    `var __ccaaCaret=__ccaaAt+__ccaaLead.length+__ccaaCleaned.length,__ccaaNode=__ccaaEl.firstChild;` +
+    `if(__ccaaFocused&&__ccaaNode&&__ccaaNode.nodeType===3&&__ccaaEl.childNodes.length===1&&__ccaaSel.focusNode===__ccaaNode){` +
+    `var __ccaaO=__ccaaSel.focusOffset;if(__ccaaO<=__ccaaAt)__ccaaCaret=__ccaaO;` +
+    `else if(__ccaaO>=__ccaaAt+__ccaaMid.length)__ccaaCaret=__ccaaO+__ccaaNext.length-__ccaaCur.length}` +
+    `if(__ccaaFocused){__ccaaSel.selectAllChildren(__ccaaEl);__ccaaDone=document.execCommand("insertText",!1,__ccaaNext)}` +
     `if(!__ccaaDone){__ccaaEl.textContent=__ccaaNext;__ccaaEl.dispatchEvent(new Event("input",{bubbles:!0}))}` +
-    // Put the caret back at the end of the dictated part, as dictation itself leaves it.
-    `var __ccaaNode=__ccaaEl.firstChild;` +
-    `if(document.activeElement===__ccaaEl&&__ccaaSel&&__ccaaNode&&__ccaaNode.nodeType===3&&__ccaaEl.childNodes.length===1){` +
-    `var __ccaaR=document.createRange();__ccaaR.setStart(__ccaaNode,Math.min(__ccaaP.length+__ccaaLead.length+__ccaaCleaned.length,__ccaaNode.length));` +
+    `__ccaaNode=__ccaaEl.firstChild;` +
+    `if(__ccaaFocused&&__ccaaNode&&__ccaaNode.nodeType===3&&__ccaaEl.childNodes.length===1){` +
+    `var __ccaaR=document.createRange();__ccaaR.setStart(__ccaaNode,Math.min(__ccaaCaret,__ccaaNode.length));` +
     `__ccaaR.collapse(!0);__ccaaSel.removeAllRanges();__ccaaSel.addRange(__ccaaR)}};` +
     // A send made while recording or cleaning is held, then replayed once the result lands
     // (or after 3s), so the cleaned text is what gets sent.
