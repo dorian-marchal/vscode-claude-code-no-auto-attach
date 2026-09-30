@@ -4,6 +4,8 @@ This VS Code extension (`claude-code-no-auto-attach`) **monkey-patches the insta
 
 All logic is in [extension.js](extension.js) (no build step, no deps, no `node_modules`). See [README.md](README.md) for the feature list and per-patch detail.
 
+⚠️ **Every change is tested, committed and pushed right away**, without being asked: run `node scripts/check.js` (plus any manual test the change needs), then commit on `main` and `git push`. Don't leave finished work uncommitted.
+
 ## How patching works (the parts that bite)
 
 - Patch targets are 3 files inside the *Claude Code* install, not this repo:
