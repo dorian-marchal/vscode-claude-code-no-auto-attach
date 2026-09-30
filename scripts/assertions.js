@@ -316,17 +316,26 @@ const WEBVIEW = [
   },
   {
     // Since 2.1.270 the launch-time read-back skips the effort (`{effort:!1}`); older
-    // bundles adopt it on every read, so there is nothing to open up.
+    // bundles adopt it on every read, so there is nothing to open up. Since 2.1.284 the
+    // read always calls the adopter and the skip moved into its `level:` flag.
     name: 'session-effort-adopt',
     rel: 'webview/index.js',
-    applies: (clean) => /if\([\w$]+\.effort!==!1&&this\.effortChangeCount===/.test(clean),
+    applies: (clean) =>
+      /if\([\w$]+\.effort!==!1&&this\.effortChangeCount===/.test(clean) ||
+      /\{level:[\w$]+\.effort===!1\|\|this\.effortChangeCount!==/.test(clean),
     check(patched) {
-      const adopt = patched.match(
+      const guard = patched.match(
         /if\(\/\*__ccaaEffortAdopt\*\/([\w$]+)\?\.ccaaEffortRestored===!0&&this\.effortChangeCount===([\w$]+)\|\|\/\*__ccaaEffortAdoptEnd\*\/[\w$]+\.effort!==!1&&this\.effortChangeCount===([\w$]+)\)this\.adoptAppliedEffort\(([\w$]+)\)/
       );
-      if (!adopt) return 'the read-back does not adopt the effort of an answer tagged ccaaEffortRestored';
-      if (adopt[1] !== adopt[4]) return 'the tag is read off another object than the applied settings it adopts';
-      return adopt[2] === adopt[3] ? null : 'the tagged branch drops the effort change counter guard';
+      const skip = patched.match(
+        /this\.adoptAppliedEffort\(([\w$]+),\{level:\/\*__ccaaEffortAdopt\*\/([\w$]+)\?\.ccaaEffortRestored===!0&&this\.effortChangeCount===([\w$]+)\?!1:\/\*__ccaaEffortAdoptEnd\*\/[\w$]+\.effort===!1\|\|this\.effortChangeCount!==([\w$]+)[,}]/
+      );
+      if (!guard && !skip) return 'the read-back does not adopt the effort of an answer tagged ccaaEffortRestored';
+      const [tagged, applied, count, upstreamCount] = guard
+        ? [guard[1], guard[4], guard[2], guard[3]]
+        : [skip[2], skip[1], skip[3], skip[4]];
+      if (tagged !== applied) return 'the tag is read off another object than the applied settings it adopts';
+      return count === upstreamCount ? null : 'the tagged branch drops the effort change counter guard';
     },
   },
   {
@@ -335,10 +344,10 @@ const WEBVIEW = [
     name: 'slash-prompt-bubble',
     rel: 'webview/index.js',
     check(patched) {
-      if (!/case"text":if\(\/\*__ccaaSlashBubble\*\/!1&&\/\*__ccaaSlashBubbleEnd\*\/[\w$]+\.isSlashCommand\)return /.test(patched)) {
+      if (!/if\(\/\*__ccaaSlashBubble\*\/!1&&\/\*__ccaaSlashBubbleEnd\*\/[\w$]+\.isSlashCommand\)return /.test(patched)) {
         return 'the bare slash-command box is not disabled';
       }
-      if (/case"text":if\([\w$]+\.isSlashCommand\)return /.test(patched)) return 'a live bare slash-command branch survives';
+      if (/[^\w$.]if\([\w$]+\.isSlashCommand\)return /.test(patched)) return 'a live bare slash-command branch survives';
       const wrap = patched.match(
         /\.map\(\(([\w$]+)\)=>\{if\(\1\.content\.type!=="text"\)return \1;let [\w$]+=\/\*__ccaaSlashText\*\/(\(\(__ccaaT\)=>\{[\s\S]*?\}\))\(\/\*__ccaaSlashTextEnd\*\/[\w$]+\(\1\.content\.text,[\w$]+\.origin,[\w$]+\)\/\*__ccaaSlashText\*\/\)\/\*__ccaaSlashTextEnd\*\/;return /
       );

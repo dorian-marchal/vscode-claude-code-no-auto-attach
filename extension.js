@@ -6,7 +6,7 @@ const os = require('os');
 const vm = require('vm');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v63*/';
+const MARKER = '/*claude-code-no-auto-attach:v64*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -307,7 +307,7 @@ function injectModelUi(content, { contextOnByDefault = false } = {}) {
   // registerAction("model") call — and read the trailing-component label var straight off the
   // registerAction options instead of the (refactored) inline declaration.
   const anchorRe =
-    /let ([\w$]+)=([\w$]+)\.modelSelection\.value,[\w$]+=[\w$]+\(\2\.claudeConfig\.value\),[\s\S]{0,400}?\.registerAction\(\{id:"model",label:"Switch model…",description:"Change the AI model",trailingComponent:([\w$]+)\?[\s\S]{0,200}?\},"Model",\(\)=>\{([\w$]+)\(!0\)\}\)/g;
+    /let ([\w$]+)=([\w$]+)\.modelSelection\.value,[\w$]+=[\w$]+\(\2\.claudeConfig\.value\),[\s\S]{0,400}?\.registerAction\(\{id:"model",label:"Switch model…",description:"Change the AI model",trailingComponent:([\w$]+)\?[\s\S]{0,200}?\},"Model",\(\)=>\{[^{}]*?([\w$]+)\(!0\)\}\)/g;
   const matches = [...content.matchAll(anchorRe)];
   if (matches.length === 0) {
     return { ok: false, reason: 'model action site not found (Claude Code internals may have changed)' };
@@ -628,7 +628,7 @@ const ASK_NOTES_REPLAY_SENTINEL_RE = /\/\*__ccaaAskNotesReplay\*\/[\s\S]*?\/\*__
 // line, and every other key is stopped so the option list's arrow/digit handling stays out.
 function injectAskQuestionNotes(content) {
   const jsxRe =
-    /([\w$]+)\("Other"\)&&([\w$]+)\("div",\{onFocus:\(\)=>([\w$]+)\(!0\),onBlur:\(\)=>\3\(!1\),onClick:\(([\w$]+)\)=>\4\.stopPropagation\(\),children:\2\(([\w$]+),\{ref:[\w$]+,className:([\w$]+)\.otherInput,placeholder:"[^"]*",value:([\w$]+)\[([\w$]+)\.question\]\|\|"",onChange:\([\w$]+\)=>([\w$]+)\([\w$]+\.question,[\w$]+\),onKeyDown:[\s\S]{0,400}?\}\}\}\)\}\)\]\}\)\]\}\)(\]\}\))/g;
+    /([\w$]+)\("Other"\)&&([\w$]+)\("div",\{onFocus:\(\)=>([\w$]+)\(!0\),onBlur:\(\)=>\3\(!1\),onClick:\(([\w$]+)\)=>\4\.stopPropagation\(\),children:\2\(([\w$]+),\{ref:[\w$]+,className:([\w$]+)\.otherInput,placeholder:"[^"]*",value:([\w$]+)\[([\w$]+)\.question\]\|\|"",onChange:\([\w$]+\)=>([\w$]+)\([\w$]+\.question,[\w$]+\),onKeyDown:[\s\S]{0,400}?\}\}\}\)\}\)(?:\]\}\)\]\}\)|\}\))(\]\}\))/g;
   const jsxMatches = [...content.matchAll(jsxRe)];
   if (jsxMatches.length === 0) {
     return { ok: false, reason: 'question "Other" input not found (Claude Code internals may have changed)' };
@@ -774,22 +774,35 @@ const EFFORT_ADOPT_SENTINEL_RE = /\/\*__ccaaEffortAdopt\*\/[\s\S]*?\/\*__ccaaEff
 // host put the session's own effort back (see injectEffortRestore), its answer carries
 // `ccaaEffortRestored`; let that one read adopt the effort, still guarded by the effort
 // change counter so a pick made during the read wins.
+// Since 2.1.284 the read always calls adoptAppliedEffort, and `level:` says whether to skip
+// the effort level: that flag is what the tagged answer turns off.
 function injectEffortAdopt(content) {
-  const anchorRe =
+  const guardRe =
     /if\(([\w$]+)\.effort!==!1&&this\.effortChangeCount===([\w$]+)\)this\.adoptAppliedEffort\(([\w$]+)\)/g;
-  const matches = [...content.matchAll(anchorRe)];
+  const skipRe =
+    /this\.adoptAppliedEffort\(([\w$]+),\{level:(?=[\w$]+\.effort===!1\|\|this\.effortChangeCount!==([\w$]+)[,}])/g;
+  const guards = [...content.matchAll(guardRe)];
+  const skips = [...content.matchAll(skipRe)];
+  const matches = guards.length ? guards : skips;
   if (matches.length === 0) {
     return { ok: false, reason: 'applied-effort read-back not found (Claude Code internals may have changed)' };
   }
-  if (matches.length > 1) {
-    return { ok: false, reason: `ambiguous: ${matches.length} applied-effort read-backs found` };
+  if (matches.length > 1 || (guards.length && skips.length)) {
+    return { ok: false, reason: `ambiguous: ${guards.length + skips.length} applied-effort read-backs found` };
   }
 
-  const [anchor, , countVar, appliedVar] = matches[0];
+  if (guards.length) {
+    const [anchor, , countVar, appliedVar] = matches[0];
+    const insertion =
+      `/*__ccaaEffortAdopt*/${appliedVar}?.ccaaEffortRestored===!0&&this.effortChangeCount===${countVar}||` +
+      `/*__ccaaEffortAdoptEnd*/`;
+    return { ok: true, content: replaceMatch(content, matches[0], 'if(' + insertion + anchor.slice(3)) };
+  }
+  const [anchor, appliedVar, countVar] = matches[0];
   const insertion =
-    `/*__ccaaEffortAdopt*/${appliedVar}?.ccaaEffortRestored===!0&&this.effortChangeCount===${countVar}||` +
+    `/*__ccaaEffortAdopt*/${appliedVar}?.ccaaEffortRestored===!0&&this.effortChangeCount===${countVar}?!1:` +
     `/*__ccaaEffortAdoptEnd*/`;
-  return { ok: true, content: replaceMatch(content, matches[0], 'if(' + insertion + anchor.slice(3)) };
+  return { ok: true, content: replaceMatch(content, matches[0], anchor + insertion) };
 }
 
 const SLASH_BUBBLE_SENTINEL_RE = /\/\*__ccaaSlashBubble\*\/[\s\S]*?\/\*__ccaaSlashBubbleEnd\*\//g;
@@ -801,7 +814,7 @@ const SLASH_TEXT_SENTINEL_RE = /\/\*__ccaaSlashText\*\/[\s\S]*?\/\*__ccaaSlashTe
 // raw message text, which for a skill still holds its <command-name>/<command-args> tags;
 // turn those into "/name args", the text the bare box showed.
 function injectSlashPromptBubble(content) {
-  const branchRe = /case"text":if\(([\w$]+)\.isSlashCommand\)return /g;
+  const branchRe = /if\(([\w$]+)\.isSlashCommand\)return /g;
   const branches = [...content.matchAll(branchRe)];
   if (branches.length !== 1) {
     return {
@@ -835,7 +848,7 @@ function injectSlashPromptBubble(content) {
   next = replaceMatch(
     next,
     branch,
-    `case"text":if(/*__ccaaSlashBubble*/!1&&/*__ccaaSlashBubbleEnd*/${branch[1]}.isSlashCommand)return `
+    `if(/*__ccaaSlashBubble*/!1&&/*__ccaaSlashBubbleEnd*/${branch[1]}.isSlashCommand)return `
   );
   return { ok: true, content: next };
 }
