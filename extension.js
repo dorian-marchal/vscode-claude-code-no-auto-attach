@@ -792,6 +792,54 @@ function injectEffortAdopt(content) {
   return { ok: true, content: replaceMatch(content, matches[0], 'if(' + insertion + anchor.slice(3)) };
 }
 
+const SLASH_BUBBLE_SENTINEL_RE = /\/\*__ccaaSlashBubble\*\/[\s\S]*?\/\*__ccaaSlashBubbleEnd\*\//g;
+const SLASH_TEXT_SENTINEL_RE = /\/\*__ccaaSlashText\*\/[\s\S]*?\/\*__ccaaSlashTextEnd\*\//g;
+
+// A prompt that starts with "/" (a skill or a command) is drawn as a bare box: no message
+// actions (fork, rewind) and no "Show more" fold, so a long one takes as much room as it
+// needs. Skip that branch so it goes through the normal prompt bubble. That bubble shows the
+// raw message text, which for a skill still holds its <command-name>/<command-args> tags;
+// turn those into "/name args", the text the bare box showed.
+function injectSlashPromptBubble(content) {
+  const branchRe = /case"text":if\(([\w$]+)\.isSlashCommand\)return /g;
+  const branches = [...content.matchAll(branchRe)];
+  if (branches.length !== 1) {
+    return {
+      ok: false,
+      reason: branches.length
+        ? `ambiguous: ${branches.length} slash-command prompt branches found`
+        : 'slash-command prompt branch not found (Claude Code internals may have changed)',
+    };
+  }
+  const textRe =
+    /(\.map\(\(([\w$]+)\)=>\{if\(\2\.content\.type!=="text"\)return \2;let [\w$]+=)([\w$]+\(\2\.content\.text,[\w$]+\.origin,[\w$]+\))(;return )/g;
+  const texts = [...content.matchAll(textRe)];
+  if (texts.length !== 1) {
+    return {
+      ok: false,
+      reason: texts.length
+        ? `ambiguous: ${texts.length} prompt text transforms found`
+        : 'prompt text transform not found (Claude Code internals may have changed)',
+    };
+  }
+
+  const [, head, , call, tail] = texts[0];
+  const toCommand =
+    `/*__ccaaSlashText*/((__ccaaT)=>{var __ccaaN=/<command-name>([\\s\\S]*?)<\\/command-name>/.exec(__ccaaT);` +
+    `if(!__ccaaN)return __ccaaT;var __ccaaA=/<command-args>([\\s\\S]*?)<\\/command-args>/.exec(__ccaaT);` +
+    `var __ccaaC=(__ccaaN[1].trim()+" "+(__ccaaA?__ccaaA[1].trim():"")).trim();` +
+    `return __ccaaC.startsWith("/")?__ccaaC:__ccaaT})(/*__ccaaSlashTextEnd*/`;
+  let next = replaceMatch(content, texts[0], head + toCommand + call + '/*__ccaaSlashText*/)/*__ccaaSlashTextEnd*/' + tail);
+  // The text edit may have moved the branch: find it again.
+  const branch = [...next.matchAll(branchRe)][0];
+  next = replaceMatch(
+    next,
+    branch,
+    `case"text":if(/*__ccaaSlashBubble*/!1&&/*__ccaaSlashBubbleEnd*/${branch[1]}.isSlashCommand)return `
+  );
+  return { ok: true, content: next };
+}
+
 const VOICE_SNAP_SENTINEL_RE = /\/\*__ccaaVoiceSnap\*\/[\s\S]*?\/\*__ccaaVoiceSnapEnd\*\//g;
 
 // The composer keeps its dictation state in a small object — the text before and after the
@@ -1523,6 +1571,7 @@ function computeWebviewPatch(content, { detachContextByDefault = true } = {}) {
     { name: 'question-draft-restore', inject: injectAskQuestionDraftRestore },
     { name: 'question-no-auto-advance', inject: injectNoQuestionAutoAdvance },
     { name: 'session-effort-adopt', inject: injectEffortAdopt },
+    { name: 'slash-prompt-bubble', inject: injectSlashPromptBubble },
     { name: 'voice-cleanup-snapshot', inject: injectVoiceSnapshot },
     // Last, so their code can't add a second match to any anchor above.
     { name: 'voice-cleanup-lib', inject: injectVoiceLib },
@@ -1550,6 +1599,8 @@ function revertWebviewPatch(content) {
   next = next.replace(SEND_MODEL_BUTTONS_SENTINEL_RE, '');
   next = next.replace(URI_OPEN_WV_SENTINEL_RE, '');
   next = next.replace(EFFORT_ADOPT_SENTINEL_RE, '');
+  next = next.replace(SLASH_BUBBLE_SENTINEL_RE, '');
+  next = next.replace(SLASH_TEXT_SENTINEL_RE, '');
   next = next.replace(VOICE_SNAP_SENTINEL_RE, '');
   return { reverted: true, content: next };
 }

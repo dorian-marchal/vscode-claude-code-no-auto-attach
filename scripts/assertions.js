@@ -19,6 +19,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const vm = require('vm');
 const pkg = require('../package.json');
 
 // --- small helpers ---
@@ -329,6 +330,34 @@ const WEBVIEW = [
     },
   },
   {
+    // A prompt starting with "/" skips the bare box for the normal bubble (message actions,
+    // "Show more"), and that bubble shows "/name args" instead of the raw command tags.
+    name: 'slash-prompt-bubble',
+    rel: 'webview/index.js',
+    check(patched) {
+      if (!/case"text":if\(\/\*__ccaaSlashBubble\*\/!1&&\/\*__ccaaSlashBubbleEnd\*\/[\w$]+\.isSlashCommand\)return /.test(patched)) {
+        return 'the bare slash-command box is not disabled';
+      }
+      if (/case"text":if\([\w$]+\.isSlashCommand\)return /.test(patched)) return 'a live bare slash-command branch survives';
+      const wrap = patched.match(
+        /\.map\(\(([\w$]+)\)=>\{if\(\1\.content\.type!=="text"\)return \1;let [\w$]+=\/\*__ccaaSlashText\*\/(\(\(__ccaaT\)=>\{[\s\S]*?\}\))\(\/\*__ccaaSlashTextEnd\*\/[\w$]+\(\1\.content\.text,[\w$]+\.origin,[\w$]+\)\/\*__ccaaSlashText\*\/\)\/\*__ccaaSlashTextEnd\*\/;return /
+      );
+      if (!wrap) return 'the bubble text memo does not pass the expanded text through the command-tag parser';
+      const toCommand = new vm.Script(wrap[2]).runInNewContext({});
+      const cases = [
+        ['<command-message>x</command-message>\n<command-name>/commit</command-name>\n<command-args> fix it </command-args>', '/commit fix it'],
+        ['<command-name>/clear</command-name>', '/clear'],
+        ['/review typed as is', '/review typed as is'],
+        ['a prompt about <command-name>tags</command-name>', 'a prompt about <command-name>tags</command-name>'],
+      ];
+      for (const [input, expected] of cases) {
+        const got = toCommand(input);
+        if (got !== expected) return `the command-tag parser turns ${JSON.stringify(input)} into ${JSON.stringify(got)}`;
+      }
+      return null;
+    },
+  },
+  {
     // The dictation state is handed over *before* the reset helper wipes it, and it is the
     // helper's own argument that is handed over.
     name: 'voice-cleanup-snapshot',
@@ -411,6 +440,9 @@ const WEBVIEW = [
         ['the recording mic label', '?"Stop recording":"Voice dictation"'],
         ['the dictation shortcut', '.key.toLowerCase()==="d"'],
         ['the replayed question prompt', 'Answering your earlier question'],
+        ['the slash-command prompt flag', '.isSlashCommand)return'],
+        ['the prompt fold button', 'children:"Show more"'],
+        ['the message actions fork callback', 'onCreateNewSession:'],
       ]),
   },
   {
