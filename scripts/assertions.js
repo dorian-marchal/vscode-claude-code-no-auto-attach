@@ -762,6 +762,30 @@ const EXTENSION = [
     },
   },
   {
+    // The built-in mic is made the default right before the native module opens the default
+    // input, and put back right after it stops. The helper picks the built-in device whose input source is the internal mic, not the headset jack.
+    name: 'dictation-builtin-mic',
+    rel: 'extension.js',
+    check(patched) {
+      if (windows(patched, '/*__ccaaMicStart*/', 0, 0).length !== 1) return 'expected one mic start hook';
+      if (windows(patched, '/*__ccaaMicStop*/', 0, 0).length !== 1) return 'expected one mic stop hook';
+      if (!/if\(([\w$]+)\.isRecording\(\)\)return"native";\/\*__ccaaMicStart\*\/try\{globalThis\.__ccaaMicStart\?\.\(\)\}catch\([\w$]+\)\{\}\/\*__ccaaMicStartEnd\*\/if\(\1\.startRecording\(/.test(patched)) {
+        return 'the start hook does not run right before the native startRecording';
+      }
+      if (!/if\(([\w$]+)\?\.isRecording\(\)\)\{\1\.stopRecording\(\);\/\*__ccaaMicStop\*\/try\{globalThis\.__ccaaMicStop\?\.\(\)\}catch\([\w$]+\)\{\}\/\*__ccaaMicStopEnd\*\/return\}/.test(patched)) {
+        return 'the stop hook does not run right after the native stopRecording';
+      }
+      const host = fs.readFileSync(path.join(__dirname, '..', 'extension.js'), 'utf8');
+      const helper = fs.readFileSync(path.join(__dirname, '..', 'mic-helper.c'), 'utf8');
+      return need(host + helper, [
+        ['the start hook registration', 'globalThis.__ccaaMicStart = onMicStart;'],
+        ['the stop hook registration', 'globalThis.__ccaaMicStop = onMicStop;'],
+        ['the internal mic lookup', 'transport == kAudioDeviceTransportTypeBuiltIn && is_internal_mic(devices[i])'],
+        ['the restore guard', 'if (default_input() != builtin) return 0;'],
+      ]);
+    },
+  },
+  {
     name: 'upstream-affordances',
     rel: 'extension.js',
     check: (_patched, clean) =>
@@ -782,6 +806,7 @@ const EXTENSION = [
         ['the speech-to-text stream message', 'type:"speech_to_text_message"'],
         ['the speech-to-text start handler', 'handleStartSpeechToText('],
         ['the bundled claude binary', '"native-binary"'],
+        ['the native audio capture module', '"audio-capture.node"'],
       ]),
   },
 ];

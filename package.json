@@ -73,6 +73,12 @@
           "order": 7,
           "markdownDescription": "When a Claude Code dictation stops, have Haiku clean up the dictated text: remove fillers (uh, um, you know), stutters, repeated words and false starts, fix words the speech-to-text clearly broke, and join fragments into full sentences, leaving the wording otherwise alone. Runs Claude Code's own `claude` binary with your login (no API key), in about a second; the composer pulses meanwhile. Sending while it runs waits for the cleaned text (3s at most), typing before it finishes keeps the raw text, and `Cmd+Z` brings it back after. Read on every recording, no reload needed."
         },
+        "claude-code-no-auto-attach.dictation.builtInMicrophone": {
+          "type": "boolean",
+          "default": true,
+          "order": 8,
+          "markdownDescription": "macOS only. Record Claude Code dictation with the Mac's built-in microphone, even when a headset is plugged in. Claude Code always records from the system's default input, so the default input is switched to the built-in mic while a recording runs and put back when it stops (unless you changed it meanwhile). Needs `clang` (Xcode Command Line Tools) once, to build a small CoreAudio helper. Read on every recording, no reload needed."
+        },
         "claude-code-no-auto-attach.quickSend.purple.model": {
           "type": "string",
           "enum": [

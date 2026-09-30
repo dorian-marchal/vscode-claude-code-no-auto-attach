@@ -1347,6 +1347,49 @@ function injectVoiceDone(content) {
   return { ok: true, content: replaceMatch(content, matches[0], anchor + insertion) };
 }
 
+const MIC_START_SENTINEL_RE = /\/\*__ccaaMicStart\*\/[\s\S]*?\/\*__ccaaMicStartEnd\*\//g;
+const MIC_STOP_SENTINEL_RE = /\/\*__ccaaMicStop\*\/[\s\S]*?\/\*__ccaaMicStopEnd\*\//g;
+
+// Dictation records through a native module that always opens the system's default input,
+// so a plugged-in headset mic wins. Call this extension right before the module starts
+// recording, so it can make the built-in mic the default (see onMicStart), and right after
+// it stops, so it can put the previous default back.
+function injectMicHooks(content) {
+  const startRe = /if\(([\w$]+)\.isRecording\(\)\)return"native";(?=if\(\1\.startRecording\()/g;
+  const starts = [...content.matchAll(startRe)];
+  if (starts.length !== 1) {
+    return {
+      ok: false,
+      reason: starts.length
+        ? `ambiguous: ${starts.length} native recording starts found`
+        : 'native recording start not found (Claude Code internals may have changed)',
+    };
+  }
+  const stopRe = /if\(([\w$]+)\?\.isRecording\(\)\)\{\1\.stopRecording\(\);(?=return\})/g;
+  const stops = [...content.matchAll(stopRe)];
+  if (stops.length !== 1) {
+    return {
+      ok: false,
+      reason: stops.length
+        ? `ambiguous: ${stops.length} native recording stops found`
+        : 'native recording stop not found (Claude Code internals may have changed)',
+    };
+  }
+
+  let next = replaceMatch(
+    content,
+    starts[0],
+    starts[0][0] + `/*__ccaaMicStart*/try{globalThis.__ccaaMicStart?.()}catch(__ccaaMicE){}/*__ccaaMicStartEnd*/`
+  );
+  const stop = [...next.matchAll(stopRe)][0];
+  next = replaceMatch(
+    next,
+    stop,
+    stop[0] + `/*__ccaaMicStop*/try{globalThis.__ccaaMicStop?.()}catch(__ccaaMicE){}/*__ccaaMicStopEnd*/`
+  );
+  return { ok: true, content: next };
+}
+
 const MD_PREVIEW_SENTINEL_RE = /\/\*__ccaaMdPreview\*\/[\s\S]*?\/\*__ccaaMdPreviewEnd\*\//g;
 const MD_PREVIEW2_SENTINEL_RE = /\/\*__ccaaMdPreview2\*\/[\s\S]*?\/\*__ccaaMdPreview2End\*\//g;
 const MD_PREVIEW3_SENTINEL_RE = /\/\*__ccaaMdPreview3\*\/[\s\S]*?\/\*__ccaaMdPreview3End\*\//g;
@@ -1676,6 +1719,7 @@ function computeExtensionPatch(content) {
     { name: 'quick-send-watch', inject: injectQuickSendWatch },
     { name: 'voice-cleanup-start', inject: injectVoiceStart },
     { name: 'voice-cleanup-done', inject: injectVoiceDone },
+    { name: 'dictation-builtin-mic', inject: injectMicHooks },
   ]);
 }
 
@@ -1698,6 +1742,8 @@ function revertExtensionPatch(content) {
   next = next.replace(QUICK_SEND_WATCH_SENTINEL_RE, '');
   next = next.replace(VOICE_START_SENTINEL_RE, '');
   next = next.replace(VOICE_DONE_SENTINEL_RE, '');
+  next = next.replace(MIC_START_SENTINEL_RE, '');
+  next = next.replace(MIC_STOP_SENTINEL_RE, '');
   return { reverted: true, content: next };
 }
 
@@ -2083,6 +2129,80 @@ async function onVoiceDone(channelId, transcript, post) {
   }
 }
 
+// Path of the compiled mic-helper.c, once built. Null off macOS or when clang is missing.
+let micHelper = null;
+// The default input to put back when the recording stops: { previous, builtin } device ids.
+let micRestore = null;
+
+function builtInMicEnabled() {
+  return vscode.workspace.getConfiguration('claude-code-no-auto-attach').get('dictation.builtInMicrophone', true);
+}
+
+// Build the helper once per source version into the extension's storage. It takes about a
+// second, so it runs at activation, not on the first recording.
+function ensureMicHelper(context) {
+  if (process.platform !== 'darwin') return;
+  const source = path.join(__dirname, 'mic-helper.c');
+  let hash;
+  try {
+    hash = hashContent(fs.readFileSync(source, 'utf8')).slice(0, 12);
+  } catch (error) {
+    voiceLog(`Mic helper source missing: ${error.message}`);
+    return;
+  }
+  const dir = context.globalStorageUri.fsPath;
+  const binary = path.join(dir, `mic-helper-${hash}`);
+  if (fs.existsSync(binary)) {
+    micHelper = binary;
+    return;
+  }
+  fs.mkdirSync(dir, { recursive: true });
+  const building = `${binary}.${process.pid}.tmp`;
+  childProcess.execFile('clang', ['-O2', '-framework', 'CoreAudio', '-o', building, source], (error, _stdout, stderr) => {
+    if (error) {
+      voiceLog(`Could not build the mic helper, dictation keeps the default input: ${(stderr || error.message).trim()}`);
+      return;
+    }
+    try {
+      fs.renameSync(building, binary);
+      for (const old of fs.readdirSync(dir)) {
+        if (old.startsWith('mic-helper-') && old !== path.basename(binary)) fs.rmSync(path.join(dir, old), { force: true });
+      }
+      micHelper = binary;
+    } catch (renameError) {
+      voiceLog(`Could not install the mic helper: ${renameError.message}`);
+    }
+  });
+}
+
+// Runs synchronously right before the native module opens the default input (~90ms), so
+// that input is already the built-in mic when it does.
+function onMicStart() {
+  if (!micHelper || !builtInMicEnabled()) return;
+  let output;
+  try {
+    output = childProcess.execFileSync(micHelper, ['builtin'], { encoding: 'utf8', timeout: 2000 });
+  } catch (error) {
+    voiceLog(`Could not switch dictation to the built-in mic: ${String(error.stderr || error.message).trim()}`);
+    return;
+  }
+  const [previous, builtin] = output.trim().split(' ');
+  // A start that failed never reached onMicStop: keep the input saved then.
+  if (previous !== builtin) {
+    micRestore = { previous, builtin };
+    voiceLog('Dictation switched the default input to the built-in mic.');
+  }
+}
+
+function onMicStop() {
+  const restore = micRestore;
+  micRestore = null;
+  if (!restore || !micHelper) return;
+  childProcess.execFile(micHelper, ['restore', restore.previous, restore.builtin], { timeout: 2000 }, (error, _stdout, stderr) => {
+    voiceLog(error ? `Could not restore the default input: ${String(stderr || error.message).trim()}` : 'Dictation restored the default input.');
+  });
+}
+
 async function revertPatch(channel) {
   const dirs = findClaudeExtensionDirs();
   if (dirs.length === 0) {
@@ -2152,6 +2272,9 @@ function activate(context) {
   voiceLog = (line) => channel.appendLine(`[no-auto-attach] ${line}`);
   globalThis.__ccaaVoiceHostStart = onVoiceStart;
   globalThis.__ccaaVoiceHostDone = onVoiceDone;
+  globalThis.__ccaaMicStart = onMicStart;
+  globalThis.__ccaaMicStop = onMicStop;
+  ensureMicHelper(context);
 
   context.subscriptions.push(
     vscode.extensions.onDidChange(() => {
@@ -2187,6 +2310,9 @@ function activate(context) {
 function deactivate() {
   if (globalThis.__ccaaVoiceHostStart === onVoiceStart) delete globalThis.__ccaaVoiceHostStart;
   if (globalThis.__ccaaVoiceHostDone === onVoiceDone) delete globalThis.__ccaaVoiceHostDone;
+  if (globalThis.__ccaaMicStart === onMicStart) delete globalThis.__ccaaMicStart;
+  if (globalThis.__ccaaMicStop === onMicStop) delete globalThis.__ccaaMicStop;
+  onMicStop();
   for (const cleaner of voiceCleaners.values()) cleaner.kill();
   voiceCleaners.clear();
 }
