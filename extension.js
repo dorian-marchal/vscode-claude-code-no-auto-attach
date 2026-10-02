@@ -6,7 +6,7 @@ const os = require('os');
 const vm = require('vm');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v65*/';
+const MARKER = '/*claude-code-no-auto-attach:v66*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -853,6 +853,55 @@ function injectSlashPromptBubble(content) {
   return { ok: true, content: next };
 }
 
+const FORK_HERE_SENTINEL_RE = /\/\*__ccaaForkHere\*\/[\s\S]*?\/\*__ccaaForkHereEnd\*\//g;
+
+// In an editor panel, "Fork conversation from here" always opens the fork in a new tab: the
+// panel has `openNewInTab` set. Add a "Fork conversation in this tab" entry next to it. It runs
+// the same fork with a flag up, and the two `openNewInTab` reads that pick the tab see the flag
+// as "no tabs", so the fork opens in this panel, as it does in the sidebar. Forking from the
+// first prompt goes through `startNewConversationTab`, which then creates the new session in
+// place too. Both reads run before the fork's first `await`, so the flag only needs to stay up
+// during the click.
+function injectForkInThisTab(content) {
+  const flag = '/*__ccaaForkHere*/!globalThis.__ccaaForkHere&&/*__ccaaForkHereEnd*/';
+  const edits = [
+    {
+      what: 'fork target read',
+      re: /(async forkConversation\([\w$]+,[\w$]+,[\w$]+\)\{let ([\w$]+)=this\.comms\.connection\.value;if\(\2\)\{let [\w$]+=)(\2\.config\.value\?\.openNewInTab,)/g,
+      replace: (m) => m[1] + flag + m[3],
+    },
+    {
+      what: 'new-tab read',
+      re: /(startNewConversationTab\([\w$]+,[\w$]+\)\{let ([\w$]+)=this\.comms\.connection\.value;if\(\2&&)(\2\.config\.value\?\.openNewInTab\))/g,
+      replace: (m) => m[1] + flag + m[3],
+    },
+    {
+      what: 'fork menu entry',
+      re: /([\w$]+)\("button",\{className:([\w$]+)\.popupOption,onClick:([\w$]+),children:\1\("span",\{className:\2\.optionText,children:"Fork conversation from here"\}\)\}\)/g,
+      replace: ([whole, h, styles, fork]) =>
+        whole +
+        `/*__ccaaForkHere*/,!window.IS_SIDEBAR&&${h}("button",{className:${styles}.popupOption,` +
+        `onClick:()=>{globalThis.__ccaaForkHere=!0;try{${fork}()}finally{globalThis.__ccaaForkHere=!1}},` +
+        `children:${h}("span",{className:${styles}.optionText,children:"Fork conversation in this tab"})})` +
+        `/*__ccaaForkHereEnd*/`,
+    },
+  ];
+  let next = content;
+  for (const edit of edits) {
+    const matches = [...next.matchAll(edit.re)];
+    if (matches.length !== 1) {
+      return {
+        ok: false,
+        reason: matches.length
+          ? `ambiguous: ${matches.length} ${edit.what} sites found`
+          : `${edit.what} not found (Claude Code internals may have changed)`,
+      };
+    }
+    next = replaceMatch(next, matches[0], edit.replace(matches[0]));
+  }
+  return { ok: true, content: next };
+}
+
 const VOICE_SNAP_SENTINEL_RE = /\/\*__ccaaVoiceSnap\*\/[\s\S]*?\/\*__ccaaVoiceSnapEnd\*\//g;
 
 // The composer keeps its dictation state in a small object — the text before and after the
@@ -1634,6 +1683,7 @@ function computeWebviewPatch(content, { detachContextByDefault = true } = {}) {
     { name: 'question-no-auto-advance', inject: injectNoQuestionAutoAdvance },
     { name: 'session-effort-adopt', inject: injectEffortAdopt },
     { name: 'slash-prompt-bubble', inject: injectSlashPromptBubble },
+    { name: 'fork-in-this-tab', inject: injectForkInThisTab },
     { name: 'voice-cleanup-snapshot', inject: injectVoiceSnapshot },
     // Last, so their code can't add a second match to any anchor above.
     { name: 'voice-cleanup-lib', inject: injectVoiceLib },
@@ -1663,6 +1713,7 @@ function revertWebviewPatch(content) {
   next = next.replace(EFFORT_ADOPT_SENTINEL_RE, '');
   next = next.replace(SLASH_BUBBLE_SENTINEL_RE, '');
   next = next.replace(SLASH_TEXT_SENTINEL_RE, '');
+  next = next.replace(FORK_HERE_SENTINEL_RE, '');
   next = next.replace(VOICE_SNAP_SENTINEL_RE, '');
   return { reverted: true, content: next };
 }

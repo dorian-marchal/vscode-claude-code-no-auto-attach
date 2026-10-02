@@ -367,6 +367,27 @@ const WEBVIEW = [
     },
   },
   {
+    // The extra menu entry raises the flag around the stock fork call, and both openNewInTab
+    // reads that pick the tab give way to it.
+    name: 'fork-in-this-tab',
+    rel: 'webview/index.js',
+    check(patched) {
+      const flag = String.raw`\/\*__ccaaForkHere\*\/!globalThis\.__ccaaForkHere&&\/\*__ccaaForkHereEnd\*\/`;
+      const forkRead = new RegExp(
+        String.raw`async forkConversation\([^)]*\)\{let ([\w$]+)=this\.comms\.connection\.value;if\(\1\)\{let ([\w$]+)=${flag}\1\.config\.value\?\.openNewInTab,[\s\S]{0,120}?if\(\2\)this\.startNewConversationTab\(`
+      );
+      if (!forkRead.test(patched)) return 'the fork does not skip the new tab while the flag is up';
+      const tabRead = new RegExp(
+        String.raw`startNewConversationTab\([^)]*\)\{let ([\w$]+)=this\.comms\.connection\.value;if\(\1&&${flag}\1\.config\.value\?\.openNewInTab\)`
+      );
+      if (!tabRead.test(patched)) return 'a fork from the first prompt still opens a new tab while the flag is up';
+      const entry =
+        /([\w$]+)\("button",\{className:([\w$]+)\.popupOption,onClick:([\w$]+),children:\1\("span",\{className:\2\.optionText,children:"Fork conversation from here"\}\)\}\)\/\*__ccaaForkHere\*\/,!window\.IS_SIDEBAR&&\1\("button",\{className:\2\.popupOption,onClick:\(\)=>\{globalThis\.__ccaaForkHere=!0;try\{\3\(\)\}finally\{globalThis\.__ccaaForkHere=!1\}\},children:\1\("span",\{className:\2\.optionText,children:"Fork conversation in this tab"\}\)\}\)\/\*__ccaaForkHereEnd\*\//;
+      if (!entry.test(patched)) return 'no "Fork conversation in this tab" entry calling the stock fork with the flag up';
+      return null;
+    },
+  },
+  {
     // The dictation state is handed over *before* the reset helper wipes it, and it is the
     // helper's own argument that is handed over.
     name: 'voice-cleanup-snapshot',
@@ -474,6 +495,8 @@ const WEBVIEW = [
         ['the slash-command prompt flag', '.isSlashCommand)return'],
         ['the prompt fold button', 'children:"Show more"'],
         ['the message actions fork callback', 'onCreateNewSession:'],
+        ['the message actions fork entry', 'children:"Fork conversation from here"'],
+        ['the in-place fork fallback', ';else this.viewSession('],
       ]),
   },
   {
