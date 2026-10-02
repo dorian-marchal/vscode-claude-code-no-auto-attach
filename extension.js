@@ -6,7 +6,7 @@ const os = require('os');
 const vm = require('vm');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v64*/';
+const MARKER = '/*claude-code-no-auto-attach:v65*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -949,6 +949,10 @@ function injectVoiceLib(content) {
     `__ccaaVoiceHold(()=>{if(__ccaaForm.isConnected)__ccaaForm.requestSubmit()})` +
     `}catch(__ccaaE){}},!0);` +
     `window.addEventListener("message",(__ccaaEv)=>{try{var __ccaaM=__ccaaEv.data;` +
+    // The host checked which input the recorder opened: the CSS colors the mic button green
+    // while the flag says it is the built-in mic.
+    `if(__ccaaM&&__ccaaM.type==="ccaa-mic"){if(__ccaaM.state==="builtin")document.body.dataset.ccaaMic="builtin";` +
+    `else delete document.body.dataset.ccaaMic;return}` +
     `if(!__ccaaM||__ccaaM.type!=="ccaa-voice")return;` +
     // A stop click saves the dictation state before "cleaning" arrives, the end of the stream
     // only after it, so "cleaning" must leave the saved state alone.
@@ -1319,7 +1323,8 @@ const VOICE_START_SENTINEL_RE = /\/\*__ccaaVoiceStart\*\/[\s\S]*?\/\*__ccaaVoice
 
 // Tell this extension a recording started, so the cleanup process boots while the user
 // speaks (see startVoiceCleaner). Only a head start: without it the process starts when
-// the recording ends, about a second later.
+// the recording ends, about a second later. It also gets a way to post to this panel's
+// webview, which the mic check uses (see verifyMic).
 function injectVoiceStart(content) {
   // The VS Code host's override; the base class has a stub that only throws.
   const anchorRe = /handleStartSpeechToText\(([\w$]+)\)\{(?=if\(this\.output\.info\()/g;
@@ -1333,7 +1338,8 @@ function injectVoiceStart(content) {
 
   const [anchor, channelVar] = matches[0];
   const insertion =
-    `/*__ccaaVoiceStart*/try{globalThis.__ccaaVoiceHostStart?.(${channelVar})}catch(__ccaaVoiceE){}/*__ccaaVoiceStartEnd*/`;
+    `/*__ccaaVoiceStart*/try{globalThis.__ccaaVoiceHostStart?.(${channelVar},` +
+    `(__ccaaVoiceMsg)=>this.webview.postMessage(__ccaaVoiceMsg))}catch(__ccaaVoiceE){}/*__ccaaVoiceStartEnd*/`;
   return { ok: true, content: replaceMatch(content, matches[0], anchor + insertion) };
 }
 
@@ -1692,6 +1698,10 @@ function computePromptHeightPatch(content) {
     // goes too, so the footer's flex gap does not leave a hole; both rules are no-ops if
     // the markup or the tooltip text changes.
     `[title*="Shift+Tab to cycle"]{display:none!important}` +
+    // Green instead of blue while recording, once the host has checked that the recorder
+    // reads the built-in mic (see verifyMic). Stays blue when that is not confirmed.
+    `body[data-ccaa-mic="builtin"] button[aria-label="Stop recording"]{--app-recording-foreground:var(--vscode-charts-green,#22c55e);` +
+    `--app-recording-background:color-mix(in srgb,var(--vscode-charts-green,#22c55e) 22%,transparent)}` +
     `div:has(>[title*="Shift+Tab to cycle"]){display:none!important}` +
     // Trim the send buttons (upstream's, plus the three model buttons injected next to it)
     // from 26px to 22px — same reason, the row has to fit more than it used to.
@@ -2094,7 +2104,12 @@ function acceptedCleanup(transcript, output) {
   return text;
 }
 
-function onVoiceStart(channelId) {
+function onVoiceStart(channelId, post) {
+  micPost = (message) => {
+    try {
+      Promise.resolve(post({ type: 'ccaa-mic', channelId, ...message })).catch(() => {});
+    } catch {}
+  };
   if (!voiceCleanupEnabled() || voiceCleaners.has(channelId)) return;
   const cleaner = startVoiceCleaner();
   if (cleaner) voiceCleaners.set(channelId, cleaner);
@@ -2146,6 +2161,11 @@ async function onVoiceDone(channelId, transcript, post) {
 let micHelper = null;
 // The default input to put back when the recording stops: { previous, builtin } device ids.
 let micRestore = null;
+// Posts a "ccaa-mic" message to the webview of the last recording started (see onVoiceStart).
+let micPost = null;
+// The running check of the input the recorder really opened: { builtin, post, timer }.
+let micCheck = null;
+const MIC_CHECK_DELAYS_MS = [150, 300, 600, 1000];
 
 function builtInMicEnabled() {
   return vscode.workspace.getConfiguration('claude-code-no-auto-attach').get('dictation.builtInMicrophone', true);
@@ -2171,7 +2191,7 @@ function ensureMicHelper(context) {
   }
   fs.mkdirSync(dir, { recursive: true });
   const building = `${binary}.${process.pid}.tmp`;
-  childProcess.execFile('clang', ['-O2', '-framework', 'CoreAudio', '-o', building, source], (error, _stdout, stderr) => {
+  childProcess.execFile('clang', ['-O2', '-framework', 'CoreAudio', '-framework', 'CoreFoundation', '-o', building, source], (error, _stdout, stderr) => {
     if (error) {
       voiceLog(`Could not build the mic helper, dictation keeps the default input: ${(stderr || error.message).trim()}`);
       return;
@@ -2205,9 +2225,52 @@ function onMicStart() {
     micRestore = { previous, builtin };
     voiceLog('Dictation switched the default input to the built-in mic.');
   }
+  stopMicCheck();
+  micCheck = { builtin, post: micPost, timer: null };
+  scheduleMicCheck(micCheck, 0);
+}
+
+function scheduleMicCheck(check, attempt) {
+  check.timer = setTimeout(() => verifyMic(check, attempt), MIC_CHECK_DELAYS_MS[attempt]);
+}
+
+// Switching the default input says nothing about the device the recorder opened, so ask
+// CoreAudio which inputs this process (the recorder runs in it) really reads. Only then the
+// webview colors the mic button green. The recorder opens its input a few ms after start.
+function verifyMic(check, attempt) {
+  childProcess.execFile(micHelper, ['inputs', String(process.pid)], { encoding: 'utf8', timeout: 2000 }, (error, stdout, stderr) => {
+    if (micCheck !== check) return;
+    if (error) {
+      voiceLog(`Could not check the dictation input: ${String(stderr || error.message).trim()}`);
+      return;
+    }
+    const devices = stdout
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => ({ id: line.split(' ')[0], name: line.slice(line.indexOf(' ') + 1) }));
+    if (devices.length === 0) {
+      if (attempt + 1 < MIC_CHECK_DELAYS_MS.length) scheduleMicCheck(check, attempt + 1);
+      else voiceLog('Dictation input check: the recorder has not opened any input yet.');
+      return;
+    }
+    if (devices.every((device) => device.id === check.builtin)) {
+      check.post?.({ state: 'builtin' });
+      voiceLog('Dictation is recording from the built-in mic.');
+    } else {
+      voiceLog(`Dictation is recording from ${devices.map((device) => device.name).join(', ')}, not only the built-in mic.`);
+    }
+  });
+}
+
+function stopMicCheck() {
+  if (!micCheck) return;
+  clearTimeout(micCheck.timer);
+  micCheck.post?.({ state: 'off' });
+  micCheck = null;
 }
 
 function onMicStop() {
+  stopMicCheck();
   const restore = micRestore;
   micRestore = null;
   if (!restore || !micHelper) return;

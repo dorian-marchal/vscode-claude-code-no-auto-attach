@@ -54,9 +54,43 @@ static AudioDeviceID builtin_input(void) {
   return found;
 }
 
+static void print_device(AudioDeviceID device) {
+  AudioObjectPropertyAddress where = address(kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal);
+  CFStringRef name = NULL;
+  UInt32 size = sizeof(name);
+  char text[256] = "?";
+  if (AudioObjectGetPropertyData(device, &where, 0, NULL, &size, &name) == noErr && name) {
+    CFStringGetCString(name, text, sizeof(text), kCFStringEncodingUTF8);
+    CFRelease(name);
+  }
+  printf("%u %s\n", (unsigned)device, text);
+}
+
+// Print the input devices <pid> is recording from, one "<id> <name>" line each (macOS 14.4+).
+static int process_inputs(pid_t pid) {
+  AudioObjectPropertyAddress where = address(kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioObjectPropertyScopeGlobal);
+  AudioObjectID process = kAudioObjectUnknown;
+  UInt32 size = sizeof(process);
+  if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &where, sizeof(pid), &pid, &size, &process) != noErr) {
+    fprintf(stderr, "could not look up the process audio object\n");
+    return 1;
+  }
+  if (process == kAudioObjectUnknown) return 0;
+  AudioObjectPropertyAddress devicesWhere = address(kAudioProcessPropertyDevices, kAudioObjectPropertyScopeInput);
+  if (AudioObjectGetPropertyDataSize(process, &devicesWhere, 0, NULL, &size) != noErr) return 0;
+  AudioDeviceID *devices = malloc(size);
+  if (devices && AudioObjectGetPropertyData(process, &devicesWhere, 0, NULL, &size, devices) == noErr) {
+    for (UInt32 i = 0; i < size / sizeof(AudioDeviceID); i++) print_device(devices[i]);
+  }
+  free(devices);
+  return 0;
+}
+
 // `builtin`: make the built-in mic the default input, print "<previous> <builtin>".
 // `restore <previous> <builtin>`: put <previous> back, unless the default changed since.
+// `inputs <pid>`: list the input devices <pid> records from.
 int main(int argc, char **argv) {
+  if (argc == 3 && strcmp(argv[1], "inputs") == 0) return process_inputs((pid_t)atoi(argv[2]));
   if (argc == 2 && strcmp(argv[1], "builtin") == 0) {
     AudioDeviceID builtin = builtin_input(), previous = default_input();
     if (builtin == kAudioObjectUnknown) {

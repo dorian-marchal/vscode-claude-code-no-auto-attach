@@ -429,6 +429,28 @@ const WEBVIEW = [
     },
   },
   {
+    // The mic button turns green only once the host has seen the recorder read the built-in
+    // mic, and goes back to stock when the recording stops.
+    name: 'dictation-builtin-mic-badge',
+    rel: 'webview/index.js',
+    check(patched) {
+      const injected = block(patched, 'VoiceLib');
+      if (!injected) return 'no /*__ccaaVoiceLib*/ block';
+      if (!injected.includes('if(__ccaaM&&__ccaaM.type==="ccaa-mic"){if(__ccaaM.state==="builtin")document.body.dataset.ccaaMic="builtin";else delete document.body.dataset.ccaaMic;return}')) {
+        return 'the webview does not set the mic flag on "builtin" only and clear it otherwise';
+      }
+      const host = fs.readFileSync(path.join(__dirname, '..', 'extension.js'), 'utf8');
+      const helper = fs.readFileSync(path.join(__dirname, '..', 'mic-helper.c'), 'utf8');
+      return need(host + helper, [
+        ['the host message type', "post({ type: 'ccaa-mic', channelId, ...message })"],
+        ['the check of what this process records from', "['inputs', String(process.pid)]"],
+        ['"builtin" only when every input is the built-in mic', "if (devices.every((device) => device.id === check.builtin)) {\n      check.post?.({ state: 'builtin' });"],
+        ['the flag cleared on stop', "micCheck.post?.({ state: 'off' });"],
+        ['the helper process input lookup', 'address(kAudioProcessPropertyDevices, kAudioObjectPropertyScopeInput)'],
+      ]);
+    },
+  },
+  {
     // Upstream drift canary: the affordances the patches above anchor on. When Anthropic
     // renames or removes one, this fails loudly instead of a patch becoming a quiet no-op.
     name: 'upstream-affordances',
@@ -483,6 +505,7 @@ const CSS = [
         ['the permission-mode pill hide rule', '[title*="Shift+Tab to cycle"]{display:none!important}'],
         ['the send-button size rule', '[class*="sendButton_"]{width:22px'],
         ['the footer-label max-width', '[class*="footerButton_"]>span{max-width:min(200px,14vw)}'],
+        ['the green recording button once the built-in mic is confirmed', 'body[data-ccaa-mic="builtin"] button[aria-label="Stop recording"]{--app-recording-foreground:'],
       ]),
   },
   {
@@ -493,6 +516,7 @@ const CSS = [
         ['the prompt bubble class', 'userMessage_'],
         ['the send button class', 'sendButton_'],
         ['the footer button class', 'footerButton_'],
+        ['the recording button colors', 'background-color:var(--app-recording-background);color:var(--app-recording-foreground)'],
       ]),
   },
 ];
@@ -747,8 +771,8 @@ const EXTENSION = [
     check(patched) {
       const hooks = windows(patched, '/*__ccaaVoiceStart*/', 0, 0).length;
       if (hooks !== 1) return `expected one start hook, found ${hooks}`;
-      if (!/handleStartSpeechToText\(([\w$]+)\)\{\/\*__ccaaVoiceStart\*\/try\{globalThis\.__ccaaVoiceHostStart\?\.\(\1\)\}catch\([\w$]+\)\{\}\/\*__ccaaVoiceStartEnd\*\/if\(this\.output\.info\(/.test(patched)) {
-        return 'the start hook is not the first statement of the VS Code speech-to-text start handler';
+      if (!/handleStartSpeechToText\(([\w$]+)\)\{\/\*__ccaaVoiceStart\*\/try\{globalThis\.__ccaaVoiceHostStart\?\.\(\1,\(__ccaaVoiceMsg\)=>this\.webview\.postMessage\(__ccaaVoiceMsg\)\)\}catch\([\w$]+\)\{\}\/\*__ccaaVoiceStartEnd\*\/if\(this\.output\.info\(/.test(patched)) {
+        return 'the start hook is not the first statement of the VS Code speech-to-text start handler, with its channel and webview poster';
       }
       const host = fs.readFileSync(path.join(__dirname, '..', 'extension.js'), 'utf8');
       return host.includes('globalThis.__ccaaVoiceHostStart = onVoiceStart;') ? null : 'the extension does not register __ccaaVoiceHostStart';
