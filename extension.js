@@ -1324,7 +1324,7 @@ const VOICE_START_SENTINEL_RE = /\/\*__ccaaVoiceStart\*\/[\s\S]*?\/\*__ccaaVoice
 // Tell this extension a recording started, so the cleanup process boots while the user
 // speaks (see startVoiceCleaner). Only a head start: without it the process starts when
 // the recording ends, about a second later. It also gets a way to post to this panel's
-// webview, which the mic check uses (see verifyMic).
+// webview, which the mic check uses (see onMicWatched).
 function injectVoiceStart(content) {
   // The VS Code host's override; the base class has a stub that only throws.
   const anchorRe = /handleStartSpeechToText\(([\w$]+)\)\{(?=if\(this\.output\.info\()/g;
@@ -1699,7 +1699,7 @@ function computePromptHeightPatch(content) {
     // the markup or the tooltip text changes.
     `[title*="Shift+Tab to cycle"]{display:none!important}` +
     // Green instead of blue while recording, once the host has checked that the recorder
-    // reads the built-in mic (see verifyMic). Stays blue when that is not confirmed.
+    // reads the built-in mic (see onMicWatched). Stays blue when that is not confirmed.
     `body[data-ccaa-mic="builtin"] button[aria-label="Stop recording"]{--app-recording-foreground:var(--vscode-charts-green,#22c55e);` +
     `--app-recording-background:color-mix(in srgb,var(--vscode-charts-green,#22c55e) 22%,transparent)}` +
     `div:has(>[title*="Shift+Tab to cycle"]){display:none!important}` +
@@ -2163,9 +2163,8 @@ let micHelper = null;
 let micRestore = null;
 // Posts a "ccaa-mic" message to the webview of the last recording started (see onVoiceStart).
 let micPost = null;
-// The running check of the input the recorder really opened: { builtin, post, timer }.
+// The running check of the input the recorder really opened: { builtin, post, watcher }.
 let micCheck = null;
-const MIC_CHECK_DELAYS_MS = [150, 300, 600, 1000];
 
 function builtInMicEnabled() {
   return vscode.workspace.getConfiguration('claude-code-no-auto-attach').get('dictation.builtInMicrophone', true);
@@ -2212,59 +2211,58 @@ function ensureMicHelper(context) {
 // that input is already the built-in mic when it does.
 function onMicStart() {
   if (!micHelper || !builtInMicEnabled()) return;
+  stopMicCheck();
+  const check = { builtin: null, post: micPost, watcher: null };
+  micCheck = check;
+  // Started first, so it is ready by the time the recorder opens its input.
+  check.watcher = childProcess.execFile(
+    micHelper,
+    ['watch', String(process.pid)],
+    { encoding: 'utf8', timeout: 5000 },
+    (error, stdout, stderr) => onMicWatched(check, error, stdout, stderr)
+  );
   let output;
   try {
     output = childProcess.execFileSync(micHelper, ['builtin'], { encoding: 'utf8', timeout: 2000 });
   } catch (error) {
     voiceLog(`Could not switch dictation to the built-in mic: ${String(error.stderr || error.message).trim()}`);
+    stopMicCheck();
     return;
   }
   const [previous, builtin] = output.trim().split(' ');
+  check.builtin = builtin;
   // A start that failed never reached onMicStop: keep the input saved then.
   if (previous !== builtin) {
     micRestore = { previous, builtin };
     voiceLog('Dictation switched the default input to the built-in mic.');
   }
-  stopMicCheck();
-  micCheck = { builtin, post: micPost, timer: null };
-  scheduleMicCheck(micCheck, 0);
 }
 
-function scheduleMicCheck(check, attempt) {
-  check.timer = setTimeout(() => verifyMic(check, attempt), MIC_CHECK_DELAYS_MS[attempt]);
-}
-
-// Switching the default input says nothing about the device the recorder opened, so ask
-// CoreAudio which inputs this process (the recorder runs in it) really reads. Only then the
-// webview colors the mic button green. The recorder opens its input a few ms after start.
-function verifyMic(check, attempt) {
-  childProcess.execFile(micHelper, ['inputs', String(process.pid)], { encoding: 'utf8', timeout: 2000 }, (error, stdout, stderr) => {
-    if (micCheck !== check) return;
-    if (error) {
-      voiceLog(`Could not check the dictation input: ${String(stderr || error.message).trim()}`);
-      return;
-    }
-    const devices = stdout
-      .split('\n')
-      .filter(Boolean)
-      .map((line) => ({ id: line.split(' ')[0], name: line.slice(line.indexOf(' ') + 1) }));
-    if (devices.length === 0) {
-      if (attempt + 1 < MIC_CHECK_DELAYS_MS.length) scheduleMicCheck(check, attempt + 1);
-      else voiceLog('Dictation input check: the recorder has not opened any input yet.');
-      return;
-    }
-    if (devices.every((device) => device.id === check.builtin)) {
-      check.post?.({ state: 'builtin' });
-      voiceLog('Dictation is recording from the built-in mic.');
-    } else {
-      voiceLog(`Dictation is recording from ${devices.map((device) => device.name).join(', ')}, not only the built-in mic.`);
-    }
-  });
+// Switching the default input says nothing about the device the recorder opened, so the
+// helper watches which inputs this process (the recorder runs in it) really reads. Only
+// then the webview colors the mic button green.
+function onMicWatched(check, error, stdout, stderr) {
+  if (micCheck !== check) return;
+  check.watcher = null;
+  if (error) {
+    voiceLog(`Could not check the dictation input: ${String(stderr || error.message).trim()}`);
+    return;
+  }
+  const devices = stdout
+    .trim()
+    .split('\t')
+    .map((entry) => ({ id: entry.split(' ')[0], name: entry.slice(entry.indexOf(' ') + 1) }));
+  if (devices.every((device) => device.id === check.builtin)) {
+    check.post?.({ state: 'builtin' });
+    voiceLog('Dictation is recording from the built-in mic.');
+  } else {
+    voiceLog(`Dictation is recording from ${devices.map((device) => device.name).join(', ')}, not only the built-in mic.`);
+  }
 }
 
 function stopMicCheck() {
   if (!micCheck) return;
-  clearTimeout(micCheck.timer);
+  micCheck.watcher?.kill();
   micCheck.post?.({ state: 'off' });
   micCheck = null;
 }

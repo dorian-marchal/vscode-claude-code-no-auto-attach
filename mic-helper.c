@@ -54,7 +54,7 @@ static AudioDeviceID builtin_input(void) {
   return found;
 }
 
-static void print_device(AudioDeviceID device) {
+static void append_device(char *line, size_t room, AudioDeviceID device) {
   AudioObjectPropertyAddress where = address(kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal);
   CFStringRef name = NULL;
   UInt32 size = sizeof(name);
@@ -63,34 +63,49 @@ static void print_device(AudioDeviceID device) {
     CFStringGetCString(name, text, sizeof(text), kCFStringEncodingUTF8);
     CFRelease(name);
   }
-  printf("%u %s\n", (unsigned)device, text);
+  size_t used = strlen(line);
+  snprintf(line + used, room - used, "%s%u %s", used ? "\t" : "", (unsigned)device, text);
 }
 
-// Print the input devices <pid> is recording from, one "<id> <name>" line each (macOS 14.4+).
-static int process_inputs(pid_t pid) {
+// The input devices <pid> records from, as "<id> <name>" separated by tabs (macOS 14.4+).
+// Empty while the process has not opened any input yet.
+static void process_inputs(pid_t pid, char *line, size_t room) {
+  line[0] = 0;
   AudioObjectPropertyAddress where = address(kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioObjectPropertyScopeGlobal);
   AudioObjectID process = kAudioObjectUnknown;
   UInt32 size = sizeof(process);
-  if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &where, sizeof(pid), &pid, &size, &process) != noErr) {
-    fprintf(stderr, "could not look up the process audio object\n");
-    return 1;
-  }
-  if (process == kAudioObjectUnknown) return 0;
+  if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &where, sizeof(pid), &pid, &size, &process) != noErr) return;
+  if (process == kAudioObjectUnknown) return;
   AudioObjectPropertyAddress devicesWhere = address(kAudioProcessPropertyDevices, kAudioObjectPropertyScopeInput);
-  if (AudioObjectGetPropertyDataSize(process, &devicesWhere, 0, NULL, &size) != noErr) return 0;
+  if (AudioObjectGetPropertyDataSize(process, &devicesWhere, 0, NULL, &size) != noErr || size == 0) return;
   AudioDeviceID *devices = malloc(size);
   if (devices && AudioObjectGetPropertyData(process, &devicesWhere, 0, NULL, &size, devices) == noErr) {
-    for (UInt32 i = 0; i < size / sizeof(AudioDeviceID); i++) print_device(devices[i]);
+    for (UInt32 i = 0; i < size / sizeof(AudioDeviceID); i++) append_device(line, room, devices[i]);
   }
   free(devices);
-  return 0;
+}
+
+// Started before the recorder, so starting CoreAudio here costs nothing: print the first
+// input list <pid> records from as soon as it has one, checking every 10ms for 4s at most.
+static int watch_inputs(pid_t pid) {
+  char line[4096];
+  for (int i = 0; i < 400; i++) {
+    process_inputs(pid, line, sizeof(line));
+    if (line[0]) {
+      printf("%s\n", line);
+      return 0;
+    }
+    usleep(10000);
+  }
+  fprintf(stderr, "the recorder opened no input within 4s\n");
+  return 1;
 }
 
 // `builtin`: make the built-in mic the default input, print "<previous> <builtin>".
 // `restore <previous> <builtin>`: put <previous> back, unless the default changed since.
-// `inputs <pid>`: list the input devices <pid> records from.
+// `watch <pid>`: wait until <pid> records, then print the input devices it reads.
 int main(int argc, char **argv) {
-  if (argc == 3 && strcmp(argv[1], "inputs") == 0) return process_inputs((pid_t)atoi(argv[2]));
+  if (argc == 3 && strcmp(argv[1], "watch") == 0) return watch_inputs((pid_t)atoi(argv[2]));
   if (argc == 2 && strcmp(argv[1], "builtin") == 0) {
     AudioDeviceID builtin = builtin_input(), previous = default_input();
     if (builtin == kAudioObjectUnknown) {
@@ -114,6 +129,6 @@ int main(int argc, char **argv) {
     }
     return 0;
   }
-  fprintf(stderr, "usage: %s builtin | restore <previous> <builtin>\n", argv[0]);
+  fprintf(stderr, "usage: %s builtin | restore <previous> <builtin> | watch <pid>\n", argv[0]);
   return 2;
 }

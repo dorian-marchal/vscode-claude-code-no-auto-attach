@@ -443,8 +443,8 @@ const WEBVIEW = [
       const helper = fs.readFileSync(path.join(__dirname, '..', 'mic-helper.c'), 'utf8');
       return need(host + helper, [
         ['the host message type', "post({ type: 'ccaa-mic', channelId, ...message })"],
-        ['the check of what this process records from', "['inputs', String(process.pid)]"],
-        ['"builtin" only when every input is the built-in mic', "if (devices.every((device) => device.id === check.builtin)) {\n      check.post?.({ state: 'builtin' });"],
+        ['the watch of what this process records from', "['watch', String(process.pid)]"],
+        ['"builtin" only when every input is the built-in mic', "if (devices.every((device) => device.id === check.builtin)) {\n    check.post?.({ state: 'builtin' });"],
         ['the flag cleared on stop', "micCheck.post?.({ state: 'off' });"],
         ['the helper process input lookup', 'address(kAudioProcessPropertyDevices, kAudioObjectPropertyScopeInput)'],
       ]);
