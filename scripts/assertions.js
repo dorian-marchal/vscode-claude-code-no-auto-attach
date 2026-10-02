@@ -367,7 +367,7 @@ const WEBVIEW = [
     },
   },
   {
-    // The extra menu entry raises the flag around the stock fork call, and both openNewInTab
+    // The pencil button raises the flag around the stock fork call, and both openNewInTab
     // reads that pick the tab give way to it.
     name: 'fork-in-this-tab',
     rel: 'webview/index.js',
@@ -381,9 +381,12 @@ const WEBVIEW = [
         String.raw`startNewConversationTab\([^)]*\)\{let ([\w$]+)=this\.comms\.connection\.value;if\(\1&&${flag}\1\.config\.value\?\.openNewInTab\)`
       );
       if (!tabRead.test(patched)) return 'a fork from the first prompt still opens a new tab while the flag is up';
-      const entry =
-        /([\w$]+)\("button",\{className:([\w$]+)\.popupOption,onClick:([\w$]+),children:\1\("span",\{className:\2\.optionText,children:"Fork conversation from here"\}\)\}\)\/\*__ccaaForkHere\*\/,!window\.IS_SIDEBAR&&\1\("button",\{className:\2\.popupOption,onClick:\(\)=>\{globalThis\.__ccaaForkHere=!0;try\{\3\(\)\}finally\{globalThis\.__ccaaForkHere=!1\}\},children:\1\("span",\{className:\2\.optionText,children:"Fork conversation in this tab"\}\)\}\)\/\*__ccaaForkHereEnd\*\//;
-      if (!entry.test(patched)) return 'no "Fork conversation in this tab" entry calling the stock fork with the flag up';
+      // The button sits right before the arrow, inside the same container, and calls the
+      // handler of the menu's own "Fork conversation from here" entry.
+      const button = patched.match(
+        /\/\*__ccaaForkHere\*\/!window\.IS_SIDEBAR&&([\w$]+)\("button",\{type:"button",className:`\$\{([\w$]+)\.actionButton\}[^`]*`,[^]*?onClick:\(\)=>\{globalThis\.__ccaaForkHere=!0;try\{([\w$]+)\(\)\}finally\{globalThis\.__ccaaForkHere=!1\}\},title:"Edit prompt in this tab"[^]*?\/\*__ccaaForkHereEnd\*\/\1\("button",\{ref:[\w$]+,className:`\$\{\2\.actionButton\}[^`]*`,onClick:[^,]{1,40},title:"Message actions"[\s\S]{0,2000}?\1\("button",\{className:\2\.popupOption,onClick:\3,children:\1\("span",\{className:\2\.optionText,children:"Fork conversation from here"\}\)\}\)/
+      );
+      if (!button) return 'no "Edit prompt in this tab" button next to the arrow calling the stock fork with the flag up';
       return null;
     },
   },

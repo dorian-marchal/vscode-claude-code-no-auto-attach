@@ -6,7 +6,7 @@ const os = require('os');
 const vm = require('vm');
 const vscode = require('vscode');
 
-const MARKER = '/*claude-code-no-auto-attach:v66*/';
+const MARKER = '/*claude-code-no-auto-attach:v67*/';
 const MARKER_RE = /^\/\*claude-code-no-auto-attach:v[^*]+\*\/\n/;
 const TARGET_EXT_ID = 'Anthropic.claude-code';
 
@@ -856,12 +856,13 @@ function injectSlashPromptBubble(content) {
 const FORK_HERE_SENTINEL_RE = /\/\*__ccaaForkHere\*\/[\s\S]*?\/\*__ccaaForkHereEnd\*\//g;
 
 // In an editor panel, "Fork conversation from here" always opens the fork in a new tab: the
-// panel has `openNewInTab` set. Add a "Fork conversation in this tab" entry next to it. It runs
-// the same fork with a flag up, and the two `openNewInTab` reads that pick the tab see the flag
-// as "no tabs", so the fork opens in this panel, as it does in the sidebar. Forking from the
-// first prompt goes through `startNewConversationTab`, which then creates the new session in
-// place too. Both reads run before the fork's first `await`, so the flag only needs to stay up
-// during the click.
+// panel has `openNewInTab` set. Add a pencil button left of the prompt's message actions
+// arrow that edits the prompt in this tab in one click. It runs the menu entry's own fork with
+// a flag up, and the two `openNewInTab` reads that pick the tab see the flag as "no tabs", so
+// the fork opens in this panel, as it does in the sidebar, with the prompt back in the
+// composer. Forking from the first prompt goes through `startNewConversationTab`, which then
+// creates the new session in place too. Both reads run before the fork's first `await`, so the
+// flag only needs to stay up during the click.
 function injectForkInThisTab(content) {
   const flag = '/*__ccaaForkHere*/!globalThis.__ccaaForkHere&&/*__ccaaForkHereEnd*/';
   const edits = [
@@ -876,14 +877,19 @@ function injectForkInThisTab(content) {
       replace: (m) => m[1] + flag + m[3],
     },
     {
-      what: 'fork menu entry',
-      re: /([\w$]+)\("button",\{className:([\w$]+)\.popupOption,onClick:([\w$]+),children:\1\("span",\{className:\2\.optionText,children:"Fork conversation from here"\}\)\}\)/g,
-      replace: ([whole, h, styles, fork]) =>
-        whole +
-        `/*__ccaaForkHere*/,!window.IS_SIDEBAR&&${h}("button",{className:${styles}.popupOption,` +
+      // The arrow button and the menu's fork entry, so the button gets the arrow's look and
+      // the entry's click handler.
+      what: 'message actions button',
+      re: /([\w$]+)\("button",\{ref:[\w$]+,className:`\$\{([\w$]+)\.actionButton\}([^`]*)`,onClick:[^,]{1,40},title:"Message actions"[\s\S]{0,2000}?\1\("button",\{className:\2\.popupOption,onClick:([\w$]+),children:\1\("span",\{className:\2\.optionText,children:"Fork conversation from here"\}\)\}\)/g,
+      replace: ([whole, h, styles, visibility, fork]) =>
+        `/*__ccaaForkHere*/!window.IS_SIDEBAR&&${h}("button",{type:"button",` +
+        `className:\`\${${styles}.actionButton}${visibility}\`,style:{position:"absolute",top:0,right:"24px"},` +
         `onClick:()=>{globalThis.__ccaaForkHere=!0;try{${fork}()}finally{globalThis.__ccaaForkHere=!1}},` +
-        `children:${h}("span",{className:${styles}.optionText,children:"Fork conversation in this tab"})})` +
-        `/*__ccaaForkHereEnd*/`,
+        `title:"Edit prompt in this tab","aria-label":"Edit prompt in this tab",` +
+        `children:${h}("svg",{xmlns:"http://www.w3.org/2000/svg",fill:"none",viewBox:"0 0 24 24",strokeWidth:"2.5",stroke:"currentColor",` +
+        `children:${h}("path",{strokeLinecap:"round",strokeLinejoin:"round",d:"m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L6.832 19.82a4.5 4.5 0 0 1-1.897 1.13l-2.685.8.8-2.685a4.5 4.5 0 0 1 1.13-1.897L16.863 4.487Zm0 0L19.5 7.125"})})}),` +
+        `/*__ccaaForkHereEnd*/` +
+        whole,
     },
   ];
   let next = content;
