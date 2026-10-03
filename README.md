@@ -29,7 +29,7 @@ A personal VS Code extension that patches the installed Claude Code extension to
 
 ## How it works
 
-On activation, the extension iterates every installed `~/.vscode/extensions/anthropic.claude-code-*` directory and applies independent sub-patches to three files (a sub-patch whose anchor no longer matches is skipped and logged without blocking the others):
+On activation, the extension iterates every installed `~/.vscode/extensions/anthropic.claude-code-*` directory (except versions VS Code listed in `.obsolete` for deletion, unless the window still runs one) and applies independent sub-patches to three files (a sub-patch whose anchor no longer matches is skipped and logged without blocking the others). Patching a 5 MB bundle takes about a second and blocks the extension host, so the hash each file had after the last run is kept in `globalState`, together with a hash of the extension's own source and options; a file that still matches is skipped without running any regex. **Reapply Patch** ignores this cache:
 
 - **`webview/index.js`**
   - finds the submit handler's include-selection computation — `let n=!t`, where `t` is "message starts with `/`" (up to 2.1.263 it also carried the composer toggle, as `let gt=v&&!De`) — and replaces it with a read of one global, `(globalThis.__ccaaContextOn??!1)`, or `??!0` when `detachContextByDefault` is off. That flag is the third argument of `session.send(text,files,includeSelection,…)`, which is the only thing deciding whether `selection.value` is attached, so the one edit covers both features: context is detached by default, and the slash-command drop is gone (the toggle alone decides). `??` and not `!!`, so the default still holds if the Ctrl+F patch below was skipped. The original expression is parked in a `/*__ccaaSlashSel:…*/` sentinel comment for a byte-exact revert;
@@ -120,4 +120,4 @@ Each patched file is prefixed with a versioned marker so re-launches don't re-pa
 ## Commands
 
 - **Claude Code No Auto-Attach: Reapply Patch** — manually re-run the patch (useful after a Claude Code reinstall).
-- **Claude Code No Auto-Attach: Revert Patch** — strips the marker and reverses all patches across every installed Claude Code version. The extension will re-apply on next startup unless you disable it first.
+- **Claude Code No Auto-Attach: Revert Patch** — strips the marker and reverses all patches across every installed Claude Code version (except the obsolete ones). The extension will re-apply on next startup unless you disable it first.

@@ -1868,9 +1868,17 @@ function findClaudeExtensionDirs() {
     return [ext.extensionPath];
   }
 
+  // VS Code lists replaced versions in .obsolete and deletes them on a later restart.
+  // Patching them is wasted work, unless this window still runs one of them.
+  let obsolete = {};
+  try {
+    obsolete = JSON.parse(fs.readFileSync(path.join(extensionsRoot, '.obsolete'), 'utf8'));
+  } catch {}
+
   const dirs = entries
     .filter((e) => e.isDirectory() && e.name.toLowerCase().startsWith(prefix))
-    .map((e) => path.join(extensionsRoot, e.name));
+    .map((e) => path.join(extensionsRoot, e.name))
+    .filter((dir) => !obsolete[path.basename(dir)] || dir === ext.extensionPath);
 
   return dirs.length ? dirs : [ext.extensionPath];
 }
@@ -1885,6 +1893,18 @@ let reloadPromptShown = false;
 
 function hashContent(content) {
   return crypto.createHash('sha1').update(content).digest('hex');
+}
+
+// Running the patches on a 5 MB bundle takes about a second and blocks the extension
+// host. So we remember the hash of each file as the last run left it, together with a
+// stamp of the patch code and options that produced it. When both still match, a new
+// run would leave the file as it is, and we skip it.
+const PATCH_CACHE_KEY = 'patchCache';
+let ownSourceHash = null;
+
+function patchStamp(computeOptions) {
+  if (!ownSourceHash) ownSourceHash = hashContent(fs.readFileSync(__filename, 'utf8'));
+  return `${ownSourceHash}:${JSON.stringify(computeOptions)}`;
 }
 
 // Parse (without running) a script bundle; returns the error message, or null when it
@@ -1907,7 +1927,7 @@ async function promptReload(message) {
   }
 }
 
-async function applyPatch(channel, { interactive = false } = {}) {
+async function applyPatch(channel, state, { interactive = false } = {}) {
   const dirs = findClaudeExtensionDirs();
   if (dirs.length === 0) {
     channel.appendLine('[no-auto-attach] Claude Code extension not installed; nothing to patch.');
@@ -1925,6 +1945,8 @@ async function applyPatch(channel, { interactive = false } = {}) {
   const computeOptions = {
     detachContextByDefault: config.get('detachContextByDefault', true),
   };
+  const stamp = patchStamp(computeOptions);
+  const cache = { ...state.get(PATCH_CACHE_KEY, {}) };
 
   for (const dir of dirs) {
     for (const site of PATCH_SITES) {
@@ -1939,13 +1961,26 @@ async function applyPatch(channel, { interactive = false } = {}) {
         continue;
       }
 
+      const contentHash = hashContent(content);
       if (!loadedBundleHashes.has(filePath)) {
-        loadedBundleHashes.set(filePath, hashContent(content));
+        loadedBundleHashes.set(filePath, contentHash);
       }
       const loadedHash = loadedBundleHashes.get(filePath);
-      const markStale = (finalContent) => {
-        if (hashContent(finalContent) !== loadedHash) anyStale = true;
+      const markStale = (finalHash) => {
+        if (finalHash !== loadedHash) anyStale = true;
       };
+      const notes = [];
+      const remember = (finalHash) => {
+        cache[filePath] = { stamp, hash: finalHash, notes };
+      };
+
+      const cached = cache[filePath];
+      if (!interactive && cached && cached.stamp === stamp && cached.hash === contentHash) {
+        channel.appendLine(`[no-auto-attach] Skipped ${relLabel} (unchanged since the last run).`);
+        for (const note of cached.notes) channel.appendLine(`[no-auto-attach]   last run: ${note}.`);
+        markStale(contentHash);
+        continue;
+      }
 
       const reverted = site.revert(content);
       const baseContent = reverted.reverted ? reverted.content : content;
@@ -1954,18 +1989,22 @@ async function applyPatch(channel, { interactive = false } = {}) {
       if (!result.patched) {
         channel.appendLine(`[no-auto-attach] Skipped ${relLabel} (${result.reason}).`);
         skipMessages.push(`${relLabel}: ${result.reason}`);
-        markStale(content);
+        notes.push(`skipped (${result.reason})`);
+        remember(contentHash);
+        markStale(contentHash);
         continue;
       }
 
       for (const warning of result.warnings || []) {
         channel.appendLine(`[no-auto-attach] Partial patch ${relLabel}: ${warning}.`);
         skipMessages.push(`${relLabel}: ${warning}`);
+        notes.push(`partial patch: ${warning}`);
       }
 
       if (result.content === content) {
         channel.appendLine(`[no-auto-attach] Skipped ${relLabel} (already at current version).`);
-        markStale(content);
+        remember(contentHash);
+        markStale(contentHash);
         continue;
       }
 
@@ -1980,8 +2019,10 @@ async function applyPatch(channel, { interactive = false } = {}) {
         channel.appendLine(`[no-auto-attach] Patched ${relLabel} does not parse (${syntaxError}); writing the unpatched bundle instead.`);
         skipMessages.push(`${relLabel}: patched bundle does not parse (${syntaxError})`);
         vscode.window.showErrorMessage(`Claude Code patch for ${relLabel} produced invalid code and was not applied: ${syntaxError}`);
+        notes.push(`patched bundle does not parse (${syntaxError})`);
         if (baseContent === content) {
-          markStale(content);
+          remember(contentHash);
+          markStale(contentHash);
           continue;
         }
         output = baseContent;
@@ -2001,9 +2042,17 @@ async function applyPatch(channel, { interactive = false } = {}) {
         channel.appendLine(`[no-auto-attach] Patched ${filePath} (${site.description}).`);
       }
       anyApplied = true;
-      markStale(output);
+      const outputHash = hashContent(output);
+      remember(outputHash);
+      markStale(outputHash);
     }
   }
+
+  // Forget files from deleted versions so the cache does not grow forever.
+  for (const filePath of Object.keys(cache)) {
+    if (!dirs.some((dir) => filePath.startsWith(dir + path.sep))) delete cache[filePath];
+  }
+  await state.update(PATCH_CACHE_KEY, cache);
 
   if (anyApplied) {
     // A fresh write is worth re-asking about even if an earlier prompt was dismissed.
@@ -2397,7 +2446,7 @@ function activate(context) {
   const channel = vscode.window.createOutputChannel('Claude Code: No Auto-Attach');
   context.subscriptions.push(channel);
 
-  applyPatch(channel);
+  applyPatch(channel, context.globalState);
 
   // Called by the patched Claude Code host (same extension host, so same globalThis).
   voiceLog = (line) => channel.appendLine(`[no-auto-attach] ${line}`);
@@ -2410,7 +2459,7 @@ function activate(context) {
   context.subscriptions.push(
     vscode.extensions.onDidChange(() => {
       channel.appendLine('[no-auto-attach] Extensions changed; re-checking patch.');
-      applyPatch(channel);
+      applyPatch(channel, context.globalState);
     })
   );
 
@@ -2420,14 +2469,14 @@ function activate(context) {
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('claude-code-no-auto-attach.detachContextByDefault')) {
         channel.appendLine('[no-auto-attach] detachContextByDefault changed; re-applying patch.');
-        applyPatch(channel);
+        applyPatch(channel, context.globalState);
       }
     })
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand('claude-code-no-auto-attach.apply', () =>
-      applyPatch(channel, { interactive: true })
+      applyPatch(channel, context.globalState, { interactive: true })
     )
   );
 
@@ -2452,6 +2501,7 @@ module.exports = {
   activate,
   deactivate,
   // exported for tests
+  applyPatch,
   QUICK_SEND_SLOTS,
   computeWebviewPatch,
   revertWebviewPatch,
